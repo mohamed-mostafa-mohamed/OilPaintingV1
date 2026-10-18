@@ -1,0 +1,29 @@
+OilStudio - how to install
+==========================
+You only need an internet connection for the first build. The build
+installs everything else by itself (Python, OpenCV, the app window, ...).
+Photoshop is NOT needed - Photoshop actions (.atn) run inside OilStudio.
+First build: 5-15 minutes.
+
+MAC
+1. Unzip this folder.
+2. Right-click "Build OilStudio (Mac).command" > Open > Open.
+   (A plain double-click is blocked the first time because the file came
+   from the internet.)
+3. If Python is missing, the window asks for this Mac's login password
+   to install it - type it and press Enter (nothing shows while typing).
+4. When it finishes, OilStudio is in Applications and opens by itself.
+
+WINDOWS
+1. Unzip this folder.
+2. Double-click build\build_windows.bat
+   (if Windows shows "Windows protected your PC": More info > Run anyway).
+3. When it finishes, the dist\OilStudio folder opens:
+   run OilStudio.exe from there (keep it inside its folder).
+
+ADDING YOUR PHOTOSHOP ACTIONS
+Open OilStudio > Actions (.atn) panel > "+ Add action" and choose the
+.atn file with its .abr/.pat files, or the whole Envato .zip. Then press
+"Run action".
+
+If anything fails, send a screenshot of the window to the developer.

@@ -1,0 +1,15 @@
+OilStudio - repo ready for the protected Mac build
+===================================================
+This is a cleaned copy. Removed vs your old folder:
+  - the duplicate nested "OilPainting" folder (old copy + .build-venv, ~100+ MB)
+  - all __pycache__ folders and *.pyc files
+Fixed:
+  - build/OilStudio-protected.spec had a broken line (empty "if sys.platform ==
+    win32:") that was a syntax error and would stop every protected build.
+    Removed. Verified the whole pipeline runs and the app smoke-tests OK.
+
+TO BUILD THE PROTECTED APP ON A MAC
+  1. Copy this whole folder to the Mac.
+  2. Right-click "Build OilStudio Protected (Mac).command" > Open > Open.
+  3. When it finishes, send the client: dist-protected/OilStudio-mac.zip
+     (no readable code inside).

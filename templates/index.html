@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OilStudio — Oil Painting from Photos</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎨</text></svg>">
+<link rel="stylesheet" href="{{ asset('css/style.css') }}">
+</head>
+
+{% macro slider(key, label, hint='', step=1) -%}
+  {% set spec = schema[key] %}
+  <div class="row" data-key="{{ key }}" title="{{ hint }}">
+    <label for="f-{{ key }}">{{ label }}</label>
+    <input type="range" id="f-{{ key }}" class="par" data-key="{{ key }}"
+           min="{{ spec[1] }}" max="{{ spec[2] }}" step="{{ step }}"
+           value="{{ spec[0] }}">
+    <input type="number" class="num par-num" data-key="{{ key }}"
+           min="{{ spec[1] }}" max="{{ spec[2] }}" step="{{ step }}"
+           value="{{ spec[0] }}">
+  </div>
+{%- endmacro %}
+
+{% macro check(key, label, hint='') -%}
+  <div class="row check" title="{{ hint }}">
+    <label><input type="checkbox" class="par-check" data-key="{{ key }}"
+       {% if schema[key][0] %}checked{% endif %}> {{ label }}</label>
+  </div>
+{%- endmacro %}
+
+{% macro choice(key, label) -%}
+  <div class="row">
+    <label for="f-{{ key }}">{{ label }}</label>
+    <select id="f-{{ key }}" class="par-choice" data-key="{{ key }}">
+      {% for opt in choices[key][0] %}
+      <option value="{{ opt }}" {% if opt == choices[key][1] %}selected{% endif %}>{{ opt }}</option>
+      {% endfor %}
+    </select>
+  </div>
+{%- endmacro %}
+
+{% macro colour(key, label) -%}
+  <div class="row">
+    <label for="f-{{ key }}">{{ label }}</label>
+    <input type="color" id="f-{{ key }}" class="par-colour" data-key="{{ key }}"
+           value="{{ defaults[key] }}">
+  </div>
+{%- endmacro %}
+
+<body>
+<header class="topbar">
+  <div class="brand"><span class="dot"></span> OilStudio</div>
+
+  <label class="btn" for="file-open">Open Image</label>
+  <input type="file" id="file-open" accept="image/*" hidden>
+
+  <button class="btn primary" id="btn-run" disabled>
+    <span class="play"></span> Run
+  </button>
+  <button class="btn" id="btn-stop" disabled>Stop</button>
+  <button class="btn" id="btn-snapshot" disabled title="Add the painting as it stands to the Timeline">Snapshot</button>
+
+  <span class="sep"></span>
+  <button class="btn icon" id="btn-undo" disabled title="Undo (Ctrl+Z)">↶</button>
+  <button class="btn icon" id="btn-redo" disabled title="Redo (Ctrl+Y)">↷</button>
+
+  <span class="sep"></span>
+  <label class="inline">Quality
+    <select id="quality">
+      {% for q in quality %}
+      <option value="{{ q }}" {% if q=='normal' %}selected{% endif %}>{{ q|capitalize }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label class="inline" id="paint-on-wrap"
+         title="GPU: Run paints the strokes on the graphics card — seconds instead of tens of seconds. CPU: the finest bristle detail. Canvas Oil always uses the CPU.">Paint on
+    <select id="paint-on">
+      <option value="gpu" selected>GPU — fast</option>
+      <option value="cpu">CPU — finest</option>
+    </select>
+  </label>
+
+  <div class="spacer"></div>
+
+  <span id="live-mode" class="stats" title="How the sliders update the After image"></span>
+  <span id="stats" class="stats"></span>
+  <label class="inline">Save as
+    <select id="export-format">
+      <option value="jpg">JPEG</option><option value="png">PNG</option>
+      <option value="tif">TIFF</option>
+    </select>
+  </label>
+  <button class="btn" id="btn-export" disabled>Save</button>
+  <label class="btn" for="file-batch" title="Convert a series of images with these settings">Batch</label>
+  <input type="file" id="file-batch" accept="image/*" multiple hidden>
+</header>
+
+<div class="workspace">
+
+  <!-- ------------------------------------------------ toolbar -->
+  <nav class="toolbar" id="toolbar">
+    <button class="tool active" data-tool="pan" title="Hand — drag to scroll (H)">✋</button>
+    <button class="tool" data-tool="zoom" title="Zoom — click to zoom in, Alt+click to zoom out (Z)">🔍</button>
+    <div class="tsep"></div>
+    <button class="tool before-only" data-tool="direction" title="Stroke Direction — draw guiding lines the brush will follow">🖊</button>
+    <button class="tool before-only" data-tool="eraser" title="Eraser — remove guiding lines">🧽</button>
+    <div class="tsep"></div>
+    {% for key, spec in tools.items() %}
+    <button class="tool after-only" data-tool="{{ key }}" title="{{ spec.label }}">
+      {{ {'smudge':'👆','history':'⏪','oil':'🖌','brush3d':'🗻'}[key] }}
+    </button>
+    {% endfor %}
+    <div class="tsep"></div>
+    <button class="tool" id="btn-clear-guides" data-tool="" title="Clear all guiding lines">✖</button>
+  </nav>
+
+  <!-- ------------------------------------------------ image window -->
+  <main class="stage">
+    <div class="tabs">
+      <button class="tab active" data-tab="before">Before</button>
+      <button class="tab" data-tab="after">After</button>
+      <button class="tab" data-tab="split" title="Before and After side by side">Split</button>
+      <div class="tab-hint" id="tool-hint">Open an image to begin</div>
+      <div class="live-badge" id="live-badge" hidden></div>
+      <div class="zoomctl">
+        <button class="mini" id="zoom-out">−</button>
+        <span id="zoom-level">Fit</span>
+        <button class="mini" id="zoom-in">+</button>
+        <button class="mini" id="zoom-fit">Fit</button>
+        <button class="mini panel-toggle" id="panel-toggle" title="Hide the settings panel (Tab)">⇥</button>
+      </div>
+    </div>
+
+    <div class="canvas-wrap" id="canvas-wrap">
+      <div class="panes" id="panes">
+        <!-- Split view: the photograph on the left -->
+        <div class="viewport" id="viewport-b" hidden>
+          <img id="img-before-b" alt="Original photograph" draggable="false">
+          <span class="pane-label">Before</span>
+        </div>
+        <div class="viewport" id="viewport">
+          <img id="img-before" alt="Original photograph" draggable="false">
+          <img id="img-after" alt="Oil painting" draggable="false" hidden>
+          <canvas id="overlay"></canvas>
+          <span class="pane-label" id="label-after" hidden>After</span>
+        </div>
+      </div>
+      <button class="peek" id="btn-peek" hidden
+              title="Hold to see the original photograph (or hold the B key)">👁 Before</button>
+      <div class="empty" id="empty-state">
+        <div class="easel">🖼️</div>
+        <h2>Turn a photograph into an oil painting</h2>
+        <p>Open an image — or drag one here — choose a preset, and press Run.</p>
+      </div>
+      <div class="progress" id="progress" hidden>
+        <div class="bar"><i id="bar-fill"></i></div>
+        <div class="plabel" id="bar-label">Painting…</div>
+      </div>
+    </div>
+
+    <!-- ------------------------------------------------ timeline -->
+    <section class="timeline" id="timeline">
+      <div class="tl-head">
+        <strong>Timeline</strong>
+        <span class="muted">Intermediate shots — click one to keep it, double-click to pin</span>
+        <button class="mini" id="tl-delete" title="Delete the selected shot">Delete</button>
+      </div>
+      <div class="tl-strip" id="tl-strip"></div>
+    </section>
+  </main>
+
+  <!-- ------------------------------------------------ settings -->
+  <div class="panel-resizer" id="panel-resizer" title="Drag to make the panel wider or narrower · double-click to reset"></div>
+  <aside class="panel" id="panel">
+    <div class="presets">
+      <select id="preset-list" title="Ready-to-use combinations of settings"></select>
+      <button class="mini" id="preset-save" title="Save the current settings">Save</button>
+      <button class="mini" id="preset-del" title="Delete the selected user preset">Del</button>
+      <button class="mini" id="reset-all" title="Back to the default settings">Reset</button>
+    </div>
+
+    <div class="tool-options" id="tool-options" hidden></div>
+
+    <!-- ------------------------------------------------ Actions (.atn) -->
+    <div class="group" id="ps-group">
+      <div class="ghead collapsible" data-target="g-ps">Actions (.atn) <i>▾</i></div>
+      <div class="gbody" id="g-ps">
+        <div class="ps-status" id="ps-status">
+          <span class="led on" id="ps-led"></span>
+          <span id="ps-status-text" class="grow">Photoshop actions run right here — Photoshop is not needed.</span>
+        </div>
+
+        <div class="ps-body">
+          <div class="row">
+            <label for="ps-pack">Effect pack</label>
+            <select id="ps-pack" class="wide"></select>
+            <button class="mini" id="ps-reload" title="Scan the library folder again">↻</button>
+            <button class="mini" id="ps-open-folder" title="Open the action library folder">📂</button>
+          </div>
+          <div class="row">
+            <button class="btn wide" id="ps-add-toggle" title="Add a Photoshop action (.atn) or an Envato action .zip to the library">＋ Add action</button>
+            <button class="mini" id="ps-remove" title="Remove the selected pack from the library (your original files are not deleted)">🗑</button>
+          </div>
+          <form class="ps-add" id="ps-add" hidden>
+            <div class="tiny">Choose the <b>.atn</b> file with the files it came with — at least its
+              brushes (<b>.abr</b>) and patterns (<b>.pat</b>) — or the whole Envato <b>.zip</b>.
+              A .jpg/.png becomes the preview.</div>
+            <div class="row">
+              <label class="mini wide ps-batch" for="ps-add-files" id="ps-add-pick">Choose files…</label>
+              <input type="file" id="ps-add-files" multiple hidden>
+            </div>
+            <div class="muted tiny ps-add-list" id="ps-add-list"></div>
+            <div class="row">
+              <label for="ps-add-name">Name</label>
+              <input type="text" id="ps-add-name" class="wide txt" maxlength="80" placeholder="from the action set">
+            </div>
+            <div class="row">
+              <label for="ps-add-cat">Category</label>
+              <input type="text" id="ps-add-cat" class="wide txt" maxlength="40" placeholder="Effects" list="ps-cat-list">
+              <datalist id="ps-cat-list"></datalist>
+            </div>
+            <div class="row">
+              <label for="ps-add-brush">Focus area</label>
+              <select id="ps-add-brush" class="wide">
+                <option value="subject">Auto — find the subject</option>
+                <option value="full">Whole image</option>
+                <option value="none">No brush layer</option>
+              </select>
+            </div>
+            <div class="row">
+              <button type="submit" class="btn primary wide" id="ps-add-save" disabled>Add to library</button>
+              <button type="button" class="btn" id="ps-add-cancel">Cancel</button>
+            </div>
+          </form>
+          <img id="ps-preview" class="ps-preview" alt="" hidden>
+          <div class="row">
+            <label for="ps-action">Action</label>
+            <select id="ps-action" class="wide"></select>
+          </div>
+          <div class="muted tiny ps-scan" id="ps-scan"></div>
+          <div class="row" title="Most Envato actions paint only where a layer named “brush” is painted. OilStudio finds the subject for you.">
+            <label for="ps-brush">Focus area</label>
+            <select id="ps-brush" class="wide">
+              <option value="subject">Auto — find the subject</option>
+              <option value="full">Whole image</option>
+              <option value="none">No brush layer</option>
+            </select>
+          </div>
+          <div class="row" title="The photo is resized to this long side before the action runs. Envato actions are made for about 3500 px; smaller is faster (0 = keep size).">
+            <label for="ps-size">Long side (px)</label>
+            <input type="number" id="ps-size" class="num wide" min="0" max="8000" step="100" value="3500">
+          </div>
+          <div class="muted tiny ps-notes" id="ps-notes"></div>
+
+          <div class="row"><button class="btn primary wide" id="ps-run" disabled>Run action</button></div>
+          <div class="row">
+            <label class="mini wide ps-batch" for="ps-batch-files" title="Run this action on many photos and download a zip">Batch…</label>
+            <input type="file" id="ps-batch-files" accept="image/*" multiple hidden>
+          </div>
+          <div class="muted tiny" id="ps-folder"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="group style-group">
+      <div class="ghead">Style</div>
+      <div class="gbody">
+        {{ choice('paint_style','Painting style') }}
+        <div class="muted tiny" id="style-note"></div>
+      </div>
+    </div>
+
+    <div class="group" id="g-canvas-oil">
+      <div class="ghead">Canvas Oil <span class="muted tiny">— Envato look, no Photoshop</span></div>
+      <div class="gbody">
+        <div class="label-sm">Paint</div>
+        {{ slider('co_brush','Brush Strokes','Paints the patches over with real brush strokes. 0 = flat knife patches only (fastest).') }}
+        {{ slider('co_stroke_size','Stroke Size','How wide those brush strokes are.') }}
+        {{ slider('co_loose','Looseness','Loose, rough, quick brushwork that crosses the edges and leaves gaps. Low = careful and smooth.') }}
+        {{ slider('co_sketch','Sketch Lines','Hand-drawn outlines and hatching showing through the paint. 0 = none.') }}
+        {{ slider('co_patch','Patch Size','How big the flat, knife-cut paint patches are.') }}
+        {{ slider('co_detail','Detail','Smaller patches where the photo has detail — faces, signs, edges.') }}
+        {{ slider('co_drag','Drag','Patches run down the picture like wet paint.') }}
+        {{ slider('co_dabs','Knife Dabs','Small faceted dabs of different shade in flat areas.') }}
+        {{ slider('co_relief','Relief','Thick-paint ridges along the patch edges.') }}
+        <div class="label-sm">Surface</div>
+        {{ slider('co_canvas','Canvas','White canvas showing through the light areas, and the weave.') }}
+        {{ slider('co_scratches','Scratches','Cross-hatched knife scratches. 0 turns them off.') }}
+        {{ slider('co_speckles','Speckles','Small glowing paint spots.') }}
+        <div class="label-sm">Colour</div>
+        {{ slider('co_contrast','Contrast') }}
+        {{ slider('co_vibrance','Vibrance') }}
+        <div class="row" title="Changes the arrangement of patches, dabs and scratches.">
+          <label for="f-co_seed">Random Seed</label>
+          <input type="number" id="f-co_seed" class="num wide par-num" data-key="co_seed"
+                 min="0" max="9999" value="{{ schema['co_seed'][0] }}">
+          <button class="mini" id="co-seed-random">🎲</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="group" id="g-halftone" hidden>
+      <div class="ghead">Halftone <span class="muted tiny">— vintage halftone print</span></div>
+      <div class="gbody">
+        <div class="label-sm">Tone</div>
+        {{ slider('ht_contrast','Contrast','How punchy the black-and-white tones are.') }}
+        {{ slider('ht_clarity','Clarity','Local contrast: deeper shadows around features, crisper texture.') }}
+        <div class="label-sm">Print</div>
+        {{ slider('ht_grain','Grain','Stipple specks all over, like a coarse print. 0 = clean tones.') }}
+        {{ slider('ht_edges','Edges','Black specks along strong detail — hair, beard, outlines.') }}
+        {{ slider('ht_grid','Dot Grid','The woven cloth texture and its grid of dark dots. 0 turns it off.') }}
+        {{ slider('ht_grid_size','Grid Size','Distance between the dots (on a 4000 px picture).') }}
+        {{ slider('ht_scratches','Scratches','Light, cracked scratches across the print. 0 turns them off.') }}
+        <div class="label-sm">Colour</div>
+        {{ colour('ht_dark','Ink') }}
+        {{ colour('ht_light','Paper') }}
+        {{ slider('ht_film','Film Tone','Warm film colouring of the midtones. 0 = a straight ink-to-paper blend.') }}
+        <div class="row" title="Changes the grain and the scratches.">
+          <label for="f-ht_seed">Random Seed</label>
+          <input type="number" id="f-ht_seed" class="num wide par-num" data-key="ht_seed"
+                 min="0" max="9999" value="{{ schema['ht_seed'][0] }}">
+          <button class="mini" id="ht-seed-random">🎲</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="group" id="g-painted" hidden>
+      <div class="ghead">Painted Photo <span class="muted tiny">— cut-out paint on kraft paper</span></div>
+      <div class="gbody">
+        <div class="label-sm">Paint</div>
+        {{ slider('pp_levels','Tones','How many tones the flat paint patches use. Fewer = bolder, more poster-like.') }}
+        {{ slider('pp_detail','Detail','Smaller patches and finer edges — keeps eyes and small features.') }}
+        {{ slider('pp_outline','Outlines','Dark outlines along strong edges, like the eyes and the jacket.') }}
+        {{ slider('pp_texture','Texture','Palette-knife speckle and canvas relief in the paint.') }}
+        <div class="label-sm">Finish</div>
+        {{ slider('pp_paper','Paper','Kraft colour and old-paper stains. 0 = clean paint.') }}
+        {{ slider('pp_grain','Paper Grain','How grainy the paper is. Lower = smoother, cleaner picture.') }}
+        {{ slider('pp_grade','Film Look','Warm film colours: orange skin, cool blue-grey shadows. 0 = the photo’s own colours.') }}
+        <div class="row" title="Changes the brush texture and the paper.">
+          <label for="f-pp_seed">Random Seed</label>
+          <input type="number" id="f-pp_seed" class="num wide par-num" data-key="pp_seed"
+                 min="0" max="9999" value="{{ schema['pp_seed'][0] }}">
+          <button class="mini" id="pp-seed-random">🎲</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="group" id="g-impression" hidden>
+      <div class="ghead">Impression <span class="muted tiny">— impressionist dabs on canvas</span></div>
+      <div class="gbody">
+        <div class="label-sm">Paint</div>
+        {{ slider('im_dab','Dabs','How far the paint dabs smear the photo. Higher = looser, less detail.') }}
+        {{ slider('im_swirl','Swirl','How much the strokes curl in flat areas like the sky.') }}
+        {{ slider('im_light','Light Strokes','Long, light strokes dragged over darker paint. 0 turns them off.') }}
+        <div class="label-sm">Surface</div>
+        {{ slider('im_relief','Relief','Bristle grooves and ridges in the paint.') }}
+        {{ slider('im_canvas','Canvas','The woven canvas showing through.') }}
+        {{ slider('im_border','Border','White border round the painting. 0 = none.') }}
+        <div class="row" title="Changes the dabs, strokes and grooves.">
+          <label for="f-im_seed">Random Seed</label>
+          <input type="number" id="f-im_seed" class="num wide par-num" data-key="im_seed"
+                 min="0" max="9999" value="{{ schema['im_seed'][0] }}">
+          <button class="mini" id="im-seed-random">🎲</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="group" id="g-painting">
+      <div class="ghead">Painting</div>
+      <div class="subtabs" data-group="painting">
+        <button class="subtab active" data-sub="image">Image</button>
+        <button class="subtab" data-sub="strokes">Strokes</button>
+        <button class="subtab" data-sub="edge">Edge</button>
+      </div>
+
+      <div class="sub active" data-sub="image">
+        {{ slider('simplicity','Simplicity','Higher values wipe out detail: the picture becomes a painting rather than a photograph.') }}
+        {{ slider('direction','Direction','Low: strokes follow the edges. High: strokes all sweep the same way.') }}
+        {{ slider('global_angle','Common Angle','The direction the strokes sweep when Direction is high.') }}
+        {{ slider('wide_bg_strokes','Wide Background Strokes','Scales the brush up in uniform areas — backgrounds and skin.') }}
+        {{ slider('expression','Expression','Broad strokes with uneven edges and mixing paint.') }}
+        {{ slider('filling','Filling','Completes the painting in the empty spaces.') }}
+        {{ slider('relief','Relief','Volumetric strokes standing above the surface of the canvas.') }}
+        {{ slider('lightening','Lightening','Adds white, making the picture lighter.') }}
+        <div class="row" title="Randomises the arrangement of the brush strokes.">
+          <label for="f-random_seed">Random Seed</label>
+          <input type="number" id="f-random_seed" class="num wide par-num" data-key="random_seed"
+                 min="0" max="9999" value="{{ schema['random_seed'][0] }}">
+          <button class="mini" id="seed-random">🎲</button>
+        </div>
+        <div class="row">
+          <label for="f-blend_original">Blend with Original</label>
+          <input type="range" id="f-blend_original" class="par" data-key="blend_original"
+                 min="0" max="100" value="{{ schema['blend_original'][0] }}">
+          <input type="number" class="num par-num" data-key="blend_original"
+                 min="0" max="100" value="{{ schema['blend_original'][0] }}">
+        </div>
+        {{ choice('blend_mode','Mode') }}
+      </div>
+
+      <div class="sub" data-sub="strokes">
+        {{ slider('stroke_thickness','Stroke Thickness','The width of the brush strokes.') }}
+        {{ slider('max_stroke_length','Max Stroke Length','The longest a stroke may run.') }}
+        {{ slider('min_stroke_length','Min Stroke Length','The shortest stroke, as a percentage of the maximum.') }}
+        {{ slider('hair_thickness','Hair Thickness','Low: sharp thin bristles. High: wide smooth ones.') }}
+        {{ slider('brush_density','Brush Density','How many bristles the brush carries.') }}
+        {{ slider('intensity','Intensity','Low: the strokes mix together. High: crisp, contrasting strokes.') }}
+      </div>
+
+      <div class="sub" data-sub="edge">
+        {{ check('edge_enabled','Add Strokes','Draw extra strokes along the edges of the picture.') }}
+        <fieldset class="dep" data-dep="edge_enabled">
+          {{ slider('edge_number','Number of Strokes') }}
+          {{ slider('edge_thickness','Stroke Thickness') }}
+          {{ slider('edge_max_length','Max Stroke Length') }}
+          {{ slider('edge_smoothness','Edge Smoothness','The transparency of the stroke edges.') }}
+          {{ slider('edge_hair_thickness','Hair Thickness') }}
+          {{ check('edge_use_color','Stroke Color','Off: the strokes borrow the colours underneath.') }}
+          {{ colour('edge_color','Colour') }}
+          {{ slider('edge_relief','Relief') }}
+          {{ check('edge_ellipse','Ellipse','Arrange the strokes in an oval.') }}
+          <div class="row"><button class="mini wide" id="edge-random">Random</button></div>
+        </fieldset>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="ghead collapsible" data-target="g-abstract">Abstract Art <i>▾</i></div>
+      <div class="gbody" id="g-abstract">
+        {{ check('abstract_enabled','Enable Abstract Art') }}
+        <fieldset class="dep" data-dep="abstract_enabled">
+          <div class="label-sm">Strokes</div>
+          {{ slider('ab_color','Color','How many strokes get recoloured.') }}
+          {{ slider('ab_saturation','Saturation','Brightens random strokes.') }}
+          {{ slider('ab_contrast','Contrast','Makes random strokes darker or lighter.') }}
+          <div class="label-sm">Correction</div>
+          {{ slider('cor_hue','Hue') }}
+          {{ slider('cor_saturation','Saturation') }}
+          {{ slider('cor_brightness','Brightness') }}
+          <div class="label-sm">Distortion</div>
+          {{ slider('dist_strength','Strength','How far shapes are shifted and stretched.') }}
+          {{ slider('dist_curvature','Curvature','The waviness of the contours.') }}
+          {{ slider('dist_seed','Random Seed') }}
+        </fieldset>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="ghead collapsible" data-target="g-deco">Decoration <i>▾</i></div>
+      <div class="gbody" id="g-deco">
+        <div class="subtabs" data-group="deco" id="deco-tabs">
+          <button class="subtab active" data-sub="light" draggable="true">Light</button>
+          <button class="subtab" data-sub="canvas" draggable="true">Canvas</button>
+          <button class="subtab" data-sub="frame" draggable="true">Frame</button>
+          <button class="subtab" data-sub="text" draggable="true">Text</button>
+        </div>
+        <div class="muted tiny">Drag the tabs to change the order the effects are applied in.</div>
+
+        <div class="sub active" data-sub="light">
+          {{ check('light_enabled','Use Studio Light') }}
+          <fieldset class="dep" data-dep="light_enabled">
+            {{ slider('light_vignette','Vignette','How far the picture sinks into shadow away from the light.') }}
+            {{ slider('light_glow','Glow','A warm bloom around the brightest paint.') }}
+            {{ slider('light_warmth','Warmth','Warm key light against a cooler shadow.') }}
+            {{ slider('light_x','Light X','Where the light falls from, across the picture.') }}
+            {{ slider('light_y','Light Y','Where the light falls from, up and down.') }}
+            {{ slider('light_spread','Spread','How wide the pool of light is.') }}
+          </fieldset>
+        </div>
+
+        <div class="sub" data-sub="canvas">
+          {{ check('canvas_enabled','Use Canvas') }}
+          <fieldset class="dep" data-dep="canvas_enabled">
+            {{ choice('canvas_texture','Surface') }}
+            <div class="row">
+              <label for="file-texture">Custom sample</label>
+              <label class="mini" for="file-texture">Load…</label>
+              <input type="file" id="file-texture" accept="image/*" hidden>
+            </div>
+            {{ slider('canvas_relief','Relief') }}
+            {{ slider('canvas_scale','Scale') }}
+            {{ slider('canvas_light','Light Angle') }}
+            {{ slider('canvas_strength','Strength') }}
+          </fieldset>
+        </div>
+
+        <div class="sub" data-sub="frame">
+          {{ check('frame_enabled','Use Frame') }}
+          <fieldset class="dep" data-dep="frame_enabled">
+            {{ choice('frame_style','Style') }}
+            {{ colour('frame_color','Colour') }}
+            {{ slider('frame_width','Width') }}
+            {{ slider('frame_seed','Random Seed') }}
+          </fieldset>
+        </div>
+
+        <div class="sub" data-sub="text">
+          {{ check('text_enabled','Use Text') }}
+          <fieldset class="dep" data-dep="text_enabled">
+            <div class="row">
+              <label for="f-text_content">Text</label>
+              <input type="text" id="f-text_content" class="par-text wide"
+                     data-key="text_content" value="OilPaint" maxlength="120">
+            </div>
+            {{ choice('text_font','Font') }}
+            {{ choice('text_position','Position') }}
+            {{ colour('text_color','Colour') }}
+            {{ slider('text_size','Size') }}
+            {{ slider('text_opacity','Opacity') }}
+            {{ slider('text_angle','Angle') }}
+            {{ check('text_tile','Tile across the picture') }}
+            <div class="row">
+              <label for="file-logo">Logo</label>
+              <label class="mini" for="file-logo">Load…</label>
+              <input type="file" id="file-logo" accept="image/*" hidden>
+            </div>
+          </fieldset>
+        </div>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="ghead collapsible collapsed" data-target="g-about">About <i>▾</i></div>
+      <div class="gbody" id="g-about" hidden>
+        <p class="muted tiny">
+          Every stroke is generated by a painting engine: the photograph is
+          simplified into colour masses, a structure tensor decides which way
+          the brush runs, and the picture is built coarse-to-fine, one
+          bristled stroke at a time. The accumulated paint height is then lit
+          as an impasto relief.<br><br>
+          Sliders update the After image live: it is drawn on the graphics
+          card, from the same planned strokes that Run paints in full
+          quality.
+        </p>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script>
+window.TOOLS = {{ tools|tojson }};
+window.DEFAULTS = {{ defaults|tojson }};
+</script>
+<script src="{{ asset('js/live.js') }}"></script>
+<script src="{{ asset('js/app.js') }}"></script>
+<script src="{{ asset('js/actions.js') }}"></script>
+</body>
+</html>
