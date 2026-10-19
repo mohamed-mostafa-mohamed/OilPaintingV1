@@ -68,7 +68,7 @@
   <label class="inline">Quality
     <select id="quality">
       {% for q in quality %}
-      <option value="{{ q }}" {% if q=='normal' %}selected{% endif %}>{{ q|capitalize }}</option>
+      <option value="{{ q }}" {% if q=='normal' %}selected{% endif %}>{{ {'max': 'Max (original size)'}.get(q, q|capitalize) }}</option>
       {% endfor %}
     </select>
   </label>
@@ -268,6 +268,9 @@
       <div class="gbody">
         {{ choice('paint_style','Painting style') }}
         <div class="muted tiny" id="style-note"></div>
+        <div id="samples-wrap" hidden>
+          {{ slider('samples','Variations','How many versions each Run makes, each with new random strokes. They appear one by one in the timeline under the picture — click one to use it. The last one uses your Random Seed.') }}
+        </div>
       </div>
     </div>
 
@@ -362,6 +365,29 @@
           <input type="number" id="f-im_seed" class="num wide par-num" data-key="im_seed"
                  min="0" max="9999" value="{{ schema['im_seed'][0] }}">
           <button class="mini" id="im-seed-random">🎲</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="group" id="g-smear" hidden>
+      <div class="ghead">Oil Smear <span class="muted tiny">— paint dragged through thick strokes</span></div>
+      <div class="gbody">
+        <div class="label-sm">Paint</div>
+        {{ slider('sm_smear','Smear','How far the paint is dragged along the strokes. 0 = no smear.') }}
+        {{ slider('sm_levels','Tones','How many tones the flat paint uses. Fewer = bolder.') }}
+        {{ slider('sm_detail','Detail','Smaller patches and finer features — keeps eyes and small details.') }}
+        {{ slider('sm_relief','Brush Relief','Small brush marks inside the paint, like Photoshop’s Oil Paint lighting.') }}
+        <div class="label-sm">Surface</div>
+        {{ slider('sm_texture','Texture','The thick oil-paint strokes over the picture and the ground. 0 = none.') }}
+        {{ slider('sm_direction','Direction','Which way the strokes and smears run. 0 = vertical (top to bottom, keeps the face readable), 50 = diagonal, 100 = horizontal.') }}
+        {{ slider('sm_curve','Curve','How curvy the strokes and smears are. 0 = straight lines, 100 = strongly curving, swirling lines.') }}
+        {{ slider('sm_stroke','Stroke Size','Size of the paint strokes. Higher = bigger, longer strokes.') }}
+        {{ slider('sm_tone','Contrast','Deep blacks and a bright white ground, like the template. 0 = flat.') }}
+        <div class="row" title="Changes the paint strokes and how the picture is smeared.">
+          <label for="f-sm_seed">Random Seed</label>
+          <input type="number" id="f-sm_seed" class="num wide par-num" data-key="sm_seed"
+                 min="0" max="9999" value="{{ schema['sm_seed'][0] }}">
+          <button class="mini" id="sm-seed-random">🎲</button>
         </div>
       </div>
     </div>

@@ -1,0 +1,2 @@
+# only for tools/ (dump_psd.py, psd_to_recipe.py, verify_recipe.py) - not needed by the app
+scikit-image>=0.22

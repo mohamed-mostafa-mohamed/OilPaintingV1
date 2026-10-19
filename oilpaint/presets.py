@@ -134,6 +134,14 @@ BUILTIN = {
     "Impression - Loose": dict(paint_style="Impression", im_dab=80, im_light=70, im_swirl=65),
     "Impression - Fine": dict(paint_style="Impression", im_dab=25, im_light=35, im_relief=40),
     "Impression - No Border": dict(paint_style="Impression", im_border=0),
+    # paint smeared through a thick stroke texture (smear.py)
+    "Oil Smear": dict(paint_style="Oil Smear"),
+    "Oil Smear - Heavy Drag": dict(paint_style="Oil Smear", sm_smear=80, sm_texture=60),
+    "Oil Smear - Subtle": dict(paint_style="Oil Smear", sm_smear=25, sm_texture=35, sm_detail=70),
+    "Oil Smear - Big Strokes": dict(paint_style="Oil Smear", sm_stroke=85),
+    "Oil Smear - Horizontal": dict(paint_style="Oil Smear", sm_direction=100),
+    "Oil Smear - Curvy Vertical": dict(paint_style="Oil Smear", sm_curve=60),
+    "Oil Smear - Curvy Horizontal": dict(paint_style="Oil Smear", sm_direction=100, sm_curve=60),
     # cut-out paint on kraft paper (painted.py)
     "Painted Photo": dict(paint_style="Painted Photo"),
     "Painted Photo - Bold Poster": dict(

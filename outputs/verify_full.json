@@ -1,0 +1,27 @@
+{
+  "1 photo + smart filters  vs PSD 'Image Fx'": {
+    "psnr": 27.0,
+    "ssim": 0.9052,
+    "mae": 5.46
+  },
+  "2 + textures             vs PSD 'Image' group": {
+    "psnr": 27.66,
+    "ssim": 0.9176,
+    "mae": 5.0
+  },
+  "3 final                  vs target.jpg": {
+    "psnr": 26.59,
+    "ssim": 0.9003,
+    "mae": 4.97
+  },
+  "oracle: PSD Image Fx + our textures   vs PSD 'Image'": {
+    "psnr": 64.26,
+    "ssim": 0.9991,
+    "mae": 0.08
+  },
+  "oracle: PSD Image Fx + our textures + adjustments vs target": {
+    "psnr": 43.83,
+    "ssim": 0.9906,
+    "mae": 1.1
+  }
+}

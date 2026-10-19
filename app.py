@@ -57,17 +57,43 @@ ACTIONS_DIR = os.environ.get("OILSTUDIO_ACTIONS_DIR") or (
     else os.path.join(BASE_DIR, "ps_actions"))
 
 MAX_UPLOAD_MB = 30
-MAX_SOURCE_SIDE = 4000
+# photos are kept at their own size (up to 6000 px, for memory)
+MAX_SOURCE_SIDE = 6000
 QUALITY = {"draft": 650, "normal": 1000, "high": 1500, "max": 2400}
+# Max = the photo's own size (small photos are enlarged to at least this)
+MAX_QUALITY_MIN_SIDE = 2400
 # styles whose look lives in pixel-sized detail (grain, dot grid) are always
 # made at the photo's full size, like Photoshop; Quality only affects drafts
-FULL_SIZE_STYLES = ("Halftone", "Painted Photo", "Impression")
+FULL_SIZE_STYLES = ("Halftone", "Painted Photo", "Impression", "Oil Smear")
 
 
-def _work_side(p, quality):
-    if p.get("paint_style") in FULL_SIZE_STYLES:
-        return MAX_SOURCE_SIDE
-    return QUALITY[quality]
+def _work_side(p, quality, src_side=MAX_SOURCE_SIDE):
+    """Long side of the picture that is painted (and saved) for a Quality:
+    Max = the photo's own size, or bigger for small photos (at least
+    2400 px); High is always smaller than Max, Normal smaller than High.
+    The template styles (Halftone, Oil Smear...) live on fine detail, so
+    their steps are fractions of Max: 40 / 60 / 80 / 100 %."""
+    mx = max(int(src_side), MAX_QUALITY_MIN_SIDE)
+    quality = quality if quality in QUALITY else "normal"
+    if quality == "max":
+        return mx
+    if p.get("paint_style") in FULL_SIZE_STYLES or p.get("paint_style") == "Canvas Oil":
+        return int(mx * {"draft": 0.4, "normal": 0.6, "high": 0.8}[quality])
+    side = QUALITY[quality]
+    return min(side, int(mx * {"draft": 0.4, "normal": 0.6, "high": 0.8}[quality])) \
+        if side >= mx else side
+
+
+def work_image(src, p, quality):
+    """The photo at the size its Quality asks for (enlarged for Max when
+    the photo is small)."""
+    h, w = src.shape[:2]
+    side = _work_side(p, quality, max(h, w))
+    if side > max(h, w):
+        k = side / max(h, w)
+        return cv2.resize(src, (int(round(w * k)), int(round(h * k))),
+                          interpolation=cv2.INTER_LANCZOS4)
+    return fit(src, side)
 SESSION_TTL = 3 * 3600
 MAX_SESSIONS = 24
 UNDO_LEVELS = 20
@@ -409,7 +435,7 @@ def api_run():
         quality = body.get("quality") if body.get("quality") in QUALITY else "normal"
         shots = int(np.clip(int(body.get("snapshots", 8) or 8), 0, 16))
 
-        work = fit(d.source, _work_side(p, quality))
+        work = work_image(d.source, p, quality)
         if d.original is None or d.original.shape != work.shape:
             d.live_cache.reset()
             d.proxy_cache.reset()
@@ -454,7 +480,8 @@ def api_run():
             job["stopped"] = meta["stopped"]
             if meta.get("style") in params.CPU_STYLES:
                 job["engine"] = {"Canvas Oil": "canvas_oil", "Halftone": "halftone",
-                                 "Painted Photo": "painted", "Impression": "impression"
+                                 "Painted Photo": "painted", "Impression": "impression",
+                                 "Oil Smear": "smear"
                                  }.get(meta["style"], "canvas_oil")
         except Exception as exc:                      # noqa: BLE001
             job["error"] = f"{type(exc).__name__}: {exc}"
@@ -489,7 +516,7 @@ def api_gpu_plan():
     with d.lock:
         if d.job and d.job["running"]:
             return jsonify(error="A painting is already in progress."), 409
-        work = fit(d.source, QUALITY[quality])
+        work = work_image(d.source, p, quality)
         if d.original is None or d.original.shape != work.shape:
             d.live_cache.reset()
             d.proxy_cache.reset()
@@ -922,7 +949,7 @@ def api_batch():
     p = params.clean(_json.loads(request.form.get("params") or "{}"))
     order = _clean_order(_json.loads(request.form.get("deco_order") or "null"))
     q = request.form.get("quality")
-    side = _work_side(p, q if q in QUALITY else "normal")
+    qual = q if q in QUALITY else "normal"
     fmt = (request.form.get("format") or "jpg").lower()
 
     buf = io.BytesIO()
@@ -934,7 +961,7 @@ def api_batch():
                 failed.append(name)
                 continue
             try:
-                img = fit(decode(f.read()), side)
+                img = work_image(decode(f.read()), p, qual)
                 res, _, _ = engine.paint(img, p, snapshots=0)
                 res = D.decorate(res, p, order)
                 res = np.clip(res, 0, 255).astype(np.uint8)
@@ -1110,7 +1137,13 @@ def api_live_draft():
             abort(409, "No image is open.")
         token = d.token
     proxy = bool(body.get("proxy"))
-    src = fit(base, 360 if proxy else PROXY_SIDE)
+    if p.get("paint_style") in FULL_SIZE_STYLES:
+        # template styles: a sharp ~900 px live preview (600 while dragging)
+        src = fit(base, 600 if proxy else 900)
+    elif p.get("paint_style") == "Canvas Oil":
+        src = fit(base, 450 if proxy else 720)
+    else:
+        src = fit(base, 360 if proxy else PROXY_SIDE)
     with d.plan_lock:
         out = engine.paint_draft(src, p, d.proxy_cache, token=(token, src.shape))
     (lw, lh), _ = _live_dims(d)

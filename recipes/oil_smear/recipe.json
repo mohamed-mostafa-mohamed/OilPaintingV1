@@ -1,0 +1,171 @@
+{
+  "name": "Oil Smear (PSD)",
+  "source": "source.psd",
+  "document": {
+    "width": 3000,
+    "height": 4000
+  },
+  "steps": [
+    {
+      "op": "photo",
+      "label": "Image Fx",
+      "filters": [
+        {
+          "op": "oil_paint",
+          "label": "Oil Paint",
+          "settings": {
+            "stylization": 10.0,
+            "cleanliness": 10.0,
+            "scale": 10.0,
+            "bristle": 9.7,
+            "lighting": true,
+            "angle": -60,
+            "shine": 1.3
+          },
+          "tune": {
+            "smooth_r": 1.5,
+            "smooth_eps": 0.001,
+            "smooth_n": 1,
+            "lic_len": 2.0,
+            "relief": 0.0,
+            "spec": 0.0
+          }
+        },
+        {
+          "op": "posterize",
+          "label": "Posterize",
+          "levels": 10
+        },
+        {
+          "op": "cutout",
+          "label": "Cutout",
+          "settings": {
+            "levels": 8,
+            "simplicity": 6,
+            "fidelity": 3
+          },
+          "tune": {
+            "pre_r": 0,
+            "med": 0
+          }
+        },
+        {
+          "op": "gaussian_blur",
+          "label": "Gaussian Blur",
+          "radius": 2.0
+        },
+        {
+          "op": "displace",
+          "label": "Displace",
+          "horizontal": 30,
+          "vertical": 60,
+          "fit": "stretch",
+          "edges": "repeat",
+          "map": "displace_map.png"
+        }
+      ]
+    },
+    {
+      "op": "layer",
+      "label": "Texture",
+      "image": "texture_overlay.jpg",
+      "mode": "overlay",
+      "opacity": 0.5686
+    },
+    {
+      "op": "layer",
+      "label": "Texture",
+      "image": "texture_multiply.jpg",
+      "mode": "multiply",
+      "opacity": 0.2706
+    },
+    {
+      "op": "adjustment",
+      "label": "Vibrance 1",
+      "kind": "vibrance",
+      "settings": {
+        "_class": "null",
+        "vibrance": -12,
+        "Strt": 6
+      },
+      "opacity": 1.0
+    },
+    {
+      "op": "adjustment",
+      "label": "Curves 1",
+      "kind": "curves",
+      "settings": {
+        "version": 1,
+        "channels": [
+          {
+            "channel": "RGB",
+            "points": [
+              {
+                "in": 0,
+                "out": 0
+              },
+              {
+                "in": 72,
+                "out": 68
+              },
+              {
+                "in": 169,
+                "out": 196
+              },
+              {
+                "in": 255,
+                "out": 255
+              }
+            ]
+          }
+        ]
+      },
+      "opacity": 0.851
+    },
+    {
+      "op": "adjustment",
+      "label": "Levels 1",
+      "kind": "levels",
+      "settings": {
+        "version": 2,
+        "channels": [
+          {
+            "channel": "RGB",
+            "in_black": 12,
+            "in_white": 255,
+            "out_black": 0,
+            "out_white": 255,
+            "gamma": 1.51
+          },
+          {
+            "channel": "R",
+            "in_black": 0,
+            "in_white": 255,
+            "out_black": 0,
+            "out_white": 255,
+            "gamma": 1.0
+          },
+          {
+            "channel": "G",
+            "in_black": 0,
+            "in_white": 255,
+            "out_black": 0,
+            "out_white": 255,
+            "gamma": 1.0
+          },
+          {
+            "channel": "B",
+            "in_black": 0,
+            "in_white": 255,
+            "out_black": 0,
+            "out_white": 255,
+            "gamma": 1.0
+          }
+        ]
+      },
+      "opacity": 0.4196
+    }
+  ],
+  "unsupported": [],
+  "notes": "Oil Paint and Cutout are Adobe algorithms; 'tune' values were fitted by tools/verify_recipe.py against this PSD's Image Fx layer (SSIM)."
+}

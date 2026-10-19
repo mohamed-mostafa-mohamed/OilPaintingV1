@@ -1,0 +1,606 @@
+{
+  "name": "(document)",
+  "type": "group",
+  "children": [
+    {
+      "index": 2,
+      "name": "Background",
+      "type": "group",
+      "visible": true,
+      "opacity": 100.0,
+      "opacity_255": 255,
+      "blend_mode": "pass through",
+      "blend_key": "pass",
+      "clipping": false,
+      "bbox": {
+        "top": 0,
+        "left": 0,
+        "bottom": 0,
+        "right": 0
+      },
+      "effects": null,
+      "collapsed": true,
+      "children": [
+        {
+          "index": 1,
+          "name": "Background Color",
+          "type": "fill",
+          "visible": true,
+          "opacity": 100.0,
+          "opacity_255": 255,
+          "blend_mode": "screen",
+          "blend_key": "scrn",
+          "clipping": false,
+          "bbox": {
+            "top": 0,
+            "left": 0,
+            "bottom": 4000,
+            "right": 3000
+          },
+          "effects": null,
+          "fill": {
+            "kind": "solid color",
+            "settings": {
+              "_class": "null",
+              "Clr": {
+                "_class": "RGBC",
+                "Rd": 159.0000057220459,
+                "Grn": 159.0000057220459,
+                "Bl": 159.0000057220459
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 14,
+      "name": "Effect",
+      "type": "group",
+      "visible": true,
+      "opacity": 100.0,
+      "opacity_255": 255,
+      "blend_mode": "pass through",
+      "blend_key": "pass",
+      "clipping": false,
+      "bbox": {
+        "top": 0,
+        "left": 0,
+        "bottom": 0,
+        "right": 0
+      },
+      "effects": null,
+      "collapsed": true,
+      "children": [
+        {
+          "index": 8,
+          "name": "Image",
+          "type": "group",
+          "visible": true,
+          "opacity": 100.0,
+          "opacity_255": 255,
+          "blend_mode": "pass through",
+          "blend_key": "pass",
+          "clipping": false,
+          "bbox": {
+            "top": 0,
+            "left": 0,
+            "bottom": 0,
+            "right": 0
+          },
+          "effects": null,
+          "collapsed": true,
+          "children": [
+            {
+              "index": 5,
+              "name": "Image Fx ",
+              "type": "smart_object",
+              "visible": true,
+              "opacity": 100.0,
+              "opacity_255": 255,
+              "blend_mode": "normal",
+              "blend_key": "norm",
+              "clipping": false,
+              "bbox": {
+                "top": 0,
+                "left": 0,
+                "bottom": 4000,
+                "right": 3000
+              },
+              "effects": null,
+              "smart_object": {
+                "source_id": "40617cd0-d396-8345-a0f2-5ee573af44dd",
+                "placed_id": "f4a37634-0bdb-db42-957a-2fa6aa66bf46",
+                "size": {
+                  "_class": "Pnt ",
+                  "Wdth": 3000.0,
+                  "Hght": 4000.0
+                },
+                "transform": [
+                  0.0,
+                  0.0,
+                  3000.0,
+                  0.0,
+                  3000.0,
+                  4000.0,
+                  0.0,
+                  4000.0
+                ],
+                "filter_mask": {
+                  "enabled": true,
+                  "linked": false
+                },
+                "smart_filters": [
+                  {
+                    "order": 1,
+                    "name": "Oil Paint...",
+                    "enabled": true,
+                    "blend": {
+                      "_class": "blendOptions",
+                      "Opct": {
+                        "value": 100.0,
+                        "unit": "#Prc"
+                      },
+                      "Md": "normal"
+                    },
+                    "filter_class": "oilPaint",
+                    "settings": {
+                      "_class": "oilPaint",
+                      "lightingOn": true,
+                      "stylization": 10.0,
+                      "brushScale": 10.0,
+                      "microBrush": 9.7,
+                      "LghD": -60,
+                      "specularity": 1.3,
+                      "cleanliness": 10.0
+                    },
+                    "readable": true
+                  },
+                  {
+                    "order": 2,
+                    "name": "Posterize...",
+                    "enabled": true,
+                    "blend": {
+                      "_class": "blendOptions",
+                      "Opct": {
+                        "value": 100.0,
+                        "unit": "#Prc"
+                      },
+                      "Md": "normal"
+                    },
+                    "filter_class": "Pstr",
+                    "settings": {
+                      "_class": "Pstr",
+                      "Lvls": 10
+                    },
+                    "readable": true
+                  },
+                  {
+                    "order": 3,
+                    "name": "Filter Gallery...",
+                    "enabled": true,
+                    "blend": {
+                      "_class": "blendOptions",
+                      "Opct": {
+                        "value": 100.0,
+                        "unit": "#Prc"
+                      },
+                      "Md": "normal"
+                    },
+                    "filter_class": "GEfc",
+                    "settings": {
+                      "_class": "GEfc",
+                      "GEfk": "Ct  ",
+                      "NmbL": 8,
+                      "EdgS": 6,
+                      "EdgF": 3
+                    },
+                    "readable": true
+                  },
+                  {
+                    "order": 4,
+                    "name": "Gaussian Blur...",
+                    "enabled": true,
+                    "blend": {
+                      "_class": "blendOptions",
+                      "Opct": {
+                        "value": 100.0,
+                        "unit": "#Prc"
+                      },
+                      "Md": "normal"
+                    },
+                    "filter_class": "GsnB",
+                    "settings": {
+                      "_class": "GsnB",
+                      "Rds": {
+                        "value": 2.0,
+                        "unit": "#Pxl"
+                      }
+                    },
+                    "readable": true
+                  },
+                  {
+                    "order": 5,
+                    "name": "Displace...",
+                    "enabled": true,
+                    "blend": {
+                      "_class": "blendOptions",
+                      "Opct": {
+                        "value": 100.0,
+                        "unit": "#Prc"
+                      },
+                      "Md": "normal"
+                    },
+                    "filter_class": "Dspl",
+                    "settings": {
+                      "_class": "Dspl",
+                      "HrzS": 30,
+                      "VrtS": 60,
+                      "DspM": "StrF",
+                      "UndA": "RptE",
+                      "DspF": {
+                        "_data": "Pth ",
+                        "bytes": 196
+                      },
+                      "EmbF": true,
+                      "DspD": {
+                        "_data": "tdta",
+                        "bytes": 1500760
+                      }
+                    },
+                    "readable": true,
+                    "embedded_map_png": "refs/displace_map_L05.png",
+                    "embedded_map_size": [
+                      750,
+                      1000
+                    ],
+                    "original_map_path": ""
+                  }
+                ]
+              }
+            },
+            {
+              "index": 6,
+              "name": "Texture",
+              "type": "pixel",
+              "visible": true,
+              "opacity": 56.9,
+              "opacity_255": 145,
+              "blend_mode": "overlay",
+              "blend_key": "over",
+              "clipping": false,
+              "bbox": {
+                "top": 0,
+                "left": 0,
+                "bottom": 4000,
+                "right": 3000
+              },
+              "effects": null
+            },
+            {
+              "index": 7,
+              "name": "Texture",
+              "type": "pixel",
+              "visible": true,
+              "opacity": 27.1,
+              "opacity_255": 69,
+              "blend_mode": "multiply",
+              "blend_key": "mul ",
+              "clipping": false,
+              "bbox": {
+                "top": 0,
+                "left": 0,
+                "bottom": 4000,
+                "right": 3000
+              },
+              "effects": null
+            }
+          ]
+        },
+        {
+          "index": 13,
+          "name": "Adjustments",
+          "type": "group",
+          "visible": true,
+          "opacity": 100.0,
+          "opacity_255": 255,
+          "blend_mode": "pass through",
+          "blend_key": "pass",
+          "clipping": false,
+          "bbox": {
+            "top": 0,
+            "left": 0,
+            "bottom": 0,
+            "right": 0
+          },
+          "effects": null,
+          "collapsed": true,
+          "children": [
+            {
+              "index": 10,
+              "name": "Vibrance 1",
+              "type": "adjustment",
+              "visible": true,
+              "opacity": 100.0,
+              "opacity_255": 255,
+              "blend_mode": "normal",
+              "blend_key": "norm",
+              "clipping": false,
+              "bbox": {
+                "top": 0,
+                "left": 0,
+                "bottom": 0,
+                "right": 0
+              },
+              "mask": {
+                "bbox": [
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "default_color": 255,
+                "disabled": false,
+                "empty": true
+              },
+              "effects": null,
+              "adjustment": {
+                "kind": "vibrance",
+                "key": "vibA",
+                "settings": {
+                  "_class": "null",
+                  "vibrance": -12,
+                  "Strt": 6
+                }
+              }
+            },
+            {
+              "index": 11,
+              "name": "Curves 1",
+              "type": "adjustment",
+              "visible": true,
+              "opacity": 85.1,
+              "opacity_255": 217,
+              "blend_mode": "normal",
+              "blend_key": "norm",
+              "clipping": false,
+              "bbox": {
+                "top": 0,
+                "left": 0,
+                "bottom": 0,
+                "right": 0
+              },
+              "mask": {
+                "bbox": [
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "default_color": 255,
+                "disabled": false,
+                "empty": true
+              },
+              "effects": null,
+              "adjustment": {
+                "kind": "curves",
+                "key": "curv",
+                "settings": {
+                  "version": 1,
+                  "channels": [
+                    {
+                      "channel": "RGB",
+                      "points": [
+                        {
+                          "in": 0,
+                          "out": 0
+                        },
+                        {
+                          "in": 72,
+                          "out": 68
+                        },
+                        {
+                          "in": 169,
+                          "out": 196
+                        },
+                        {
+                          "in": 255,
+                          "out": 255
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "index": 12,
+              "name": "Levels 1",
+              "type": "adjustment",
+              "visible": true,
+              "opacity": 42.0,
+              "opacity_255": 107,
+              "blend_mode": "normal",
+              "blend_key": "norm",
+              "clipping": false,
+              "bbox": {
+                "top": 0,
+                "left": 0,
+                "bottom": 0,
+                "right": 0
+              },
+              "mask": {
+                "bbox": [
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "default_color": 255,
+                "disabled": false,
+                "empty": true
+              },
+              "effects": null,
+              "adjustment": {
+                "kind": "levels",
+                "key": "levl",
+                "settings": {
+                  "version": 2,
+                  "channels": [
+                    {
+                      "channel": "RGB",
+                      "in_black": 12,
+                      "in_white": 255,
+                      "out_black": 0,
+                      "out_white": 255,
+                      "gamma": 1.51
+                    },
+                    {
+                      "channel": "R",
+                      "in_black": 0,
+                      "in_white": 255,
+                      "out_black": 0,
+                      "out_white": 255,
+                      "gamma": 1.0
+                    },
+                    {
+                      "channel": "G",
+                      "in_black": 0,
+                      "in_white": 255,
+                      "out_black": 0,
+                      "out_white": 255,
+                      "gamma": 1.0
+                    },
+                    {
+                      "channel": "B",
+                      "in_black": 0,
+                      "in_white": 255,
+                      "out_black": 0,
+                      "out_white": 255,
+                      "gamma": 1.0
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "index": 17,
+      "name": "Place your image here",
+      "type": "group",
+      "visible": true,
+      "opacity": 100.0,
+      "opacity_255": 255,
+      "blend_mode": "pass through",
+      "blend_key": "pass",
+      "clipping": false,
+      "bbox": {
+        "top": 0,
+        "left": 0,
+        "bottom": 0,
+        "right": 0
+      },
+      "effects": null,
+      "collapsed": false,
+      "children": [
+        {
+          "index": 16,
+          "name": "Place Image Here",
+          "type": "smart_object",
+          "visible": true,
+          "opacity": 0.0,
+          "opacity_255": 0,
+          "blend_mode": "normal",
+          "blend_key": "norm",
+          "clipping": false,
+          "bbox": {
+            "top": 0,
+            "left": 0,
+            "bottom": 4000,
+            "right": 3000
+          },
+          "fill_opacity": 0.0,
+          "effects": null,
+          "smart_object": {
+            "source_id": "40617cd0-d396-8345-a0f2-5ee573af44dd",
+            "placed_id": "f190eb2b-4df8-ce42-941b-a1e92257b2f6",
+            "size": {
+              "_class": "Pnt ",
+              "Wdth": 3000.0,
+              "Hght": 4000.0
+            },
+            "transform": [
+              0.0,
+              0.0,
+              3000.0,
+              0.0,
+              3000.0,
+              4000.0,
+              0.0,
+              4000.0
+            ],
+            "smart_filters": []
+          }
+        }
+      ]
+    },
+    {
+      "index": 20,
+      "name": "Text (Hide before saving)",
+      "type": "group",
+      "visible": true,
+      "opacity": 100.0,
+      "opacity_255": 255,
+      "blend_mode": "pass through",
+      "blend_key": "pass",
+      "clipping": false,
+      "bbox": {
+        "top": 0,
+        "left": 0,
+        "bottom": 0,
+        "right": 0
+      },
+      "effects": null,
+      "collapsed": true,
+      "children": [
+        {
+          "index": 19,
+          "name": "PSD EFFECT vertical template",
+          "type": "pixel",
+          "visible": true,
+          "opacity": 100.0,
+          "opacity_255": 255,
+          "blend_mode": "normal",
+          "blend_key": "norm",
+          "clipping": false,
+          "bbox": {
+            "top": 130,
+            "left": 124,
+            "bottom": 661,
+            "right": 1499
+          },
+          "effects": null
+        }
+      ]
+    }
+  ],
+  "mode": "pass through",
+  "embedded_files": [
+    {
+      "block": "lnk2",
+      "type": "liFD",
+      "id": "40617cd0-d396-8345-a0f2-5ee573af44dd",
+      "name": "Image Fx.psb",
+      "bytes": 161587191,
+      "saved": "refs/embedded/Image Fx.psb"
+    },
+    {
+      "block": "FEid",
+      "note": "cached smart-filter input image (decoded by tools/psd_to_recipe.py)",
+      "bytes": 33326732
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+refs/source.psd: 3000 x 4000, 3 channels, 8 bit, PSD, 21 layer records
+
+Layer tree, TOP first (bottom-to-top order is in psd_tree.json):
+- [group] 'Text (Hide before saving)'  pass through 100.0%
+  - [pixel] 'PSD EFFECT vertical template'  normal 100.0%
+- [group] 'Place your image here'  pass through 100.0%
+  - [smart_object] 'Place Image Here'  normal 0.0%, fill 0.0%  smart filters: 
+- [group] 'Effect'  pass through 100.0%
+  - [group] 'Adjustments'  pass through 100.0%
+    - [adjustment] 'Levels 1'  normal 42.0%  levels: {"version": 2, "channels": [{"channel": "RGB", "in_black": 12, "in_white": 255, "out_black": 0, "out_white": 255, "gamma": 1.51}, {"channel": "R", "in_black": 0
+    - [adjustment] 'Curves 1'  normal 85.1%  curves: {"version": 1, "channels": [{"channel": "RGB", "points": [{"in": 0, "out": 0}, {"in": 72, "out": 68}, {"in": 169, "out": 196}, {"in": 255, "out": 255}]}]}
+    - [adjustment] 'Vibrance 1'  normal 100.0%  vibrance: {"_class": "null", "vibrance": -12, "Strt": 6}
+  - [group] 'Image'  pass through 100.0%
+    - [pixel] 'Texture'  multiply 27.1%
+    - [pixel] 'Texture'  overlay 56.9%
+    - [smart_object] 'Image Fx '  normal 100.0%  smart filters: Oil Paint..., Posterize..., Filter Gallery..., Gaussian Blur..., Displace...
+- [group] 'Background'  pass through 100.0%
+  - [fill] 'Background Color'  screen 100.0%  solid color
+
+Embedded files:
+   {'block': 'lnk2', 'type': 'liFD', 'id': '40617cd0-d396-8345-a0f2-5ee573af44dd', 'name': 'Image Fx.psb', 'bytes': 161587191, 'saved': 'refs/embedded/Image Fx.psb'}
+   {'block': 'FEid', 'note': 'cached smart-filter input image (decoded by tools/psd_to_recipe.py)', 'bytes': 33326732}
+
+Own composite vs the PSD's flattened image: {'psnr': 46.14, 'ssim': 0.9957, 'mae': 0.72}
+Hidden for the clean composite: ['Text (Hide before saving)']
+Own composite vs target: {'psnr': 15.78, 'ssim': 0.9535, 'mae': 8.25}
+PSD flattened image vs target: {'psnr': 15.78, 'ssim': 0.9565, 'mae': 7.83}
+Own composite with those groups hidden vs target: {'psnr': 45.49, 'ssim': 0.9947, 'mae': 0.86}

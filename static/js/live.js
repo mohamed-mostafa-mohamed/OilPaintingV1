@@ -711,7 +711,7 @@
       const sk = strokeKey(p);
       let mode = 'A';
       if (this.ranStrokeKey !== null && sk !== this.ranStrokeKey)
-        mode = ['Canvas Oil', 'Halftone', 'Painted Photo', 'Impression'].includes(p.paint_style) ? 'C' : 'B';
+        mode = ['Canvas Oil', 'Halftone', 'Painted Photo', 'Impression', 'Oil Smear'].includes(p.paint_style) ? 'C' : 'B';
       /* a Timeline shot or a Photoshop result has no strokes to restyle */
       if (!this.state.ran) mode = 'A';
       const modeChanged = mode !== this.mode;

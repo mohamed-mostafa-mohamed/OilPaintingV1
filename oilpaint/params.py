@@ -162,15 +162,38 @@ IMPRESSION = {
     "im_seed": (5, 0, 9999),
 }
 
+# Oil Smear: flat paint smeared through a thick stroke texture - see smear.py
+OIL_SMEAR = {
+    "sm_smear": (50, 0, 100),           # how far the paint is dragged (50 = template)
+    "sm_texture": (50, 0, 100),         # thick paint texture on top (50 = template)
+    "sm_direction": (0, 0, 100),        # 0 = strokes and smears run down, 100 = sideways
+    "sm_curve": (15, 0, 100),           # 0 = straight lines, 100 = very curvy lines
+    "sm_stroke": (50, 0, 100),          # size of the paint strokes (50 = template)
+    "sm_levels": (8, 3, 16),            # how many tones the flat paint uses
+    "sm_detail": (50, 0, 100),          # smaller patches, finer features
+    "sm_relief": (50, 0, 100),          # Oil Paint brush relief in the paint (50 = template)
+    "sm_tone": (50, 0, 100),            # contrast and bright ground (50 = template)
+    "sm_seed": (1, 0, 9999),
+}
+
+# the template styles (Canvas Oil, Halftone, Painted Photo, Impression,
+# Oil Smear) make several variations per Run, each with its own random seed
+SAMPLES = {
+    "samples": (8, 1, 16),
+}
+# which seed each of those styles changes for its variations
+SEED_KEYS = {"Canvas Oil": "co_seed", "Halftone": "ht_seed", "Painted Photo": "pp_seed",
+             "Impression": "im_seed", "Oil Smear": "sm_seed"}
+
 NUMERIC = {}
 for _group in (PAINTING, EDGE, ABSTRACT, LIGHT, CANVAS, FRAME, TEXT, CANVAS_OIL, HALFTONE,
-               PAINTED, IMPRESSION):
+               PAINTED, IMPRESSION, OIL_SMEAR, SAMPLES):
     NUMERIC.update(_group)
 
 # Non numeric options ------------------------------------------------------
-PAINT_STYLES = ["Brush Strokes", "Canvas Oil", "Halftone", "Painted Photo", "Impression"]
+PAINT_STYLES = ["Brush Strokes", "Canvas Oil", "Halftone", "Painted Photo", "Impression", "Oil Smear"]
 # styles made on the CPU in one go (no strokes for the GPU to restyle)
-CPU_STYLES = ("Canvas Oil", "Halftone", "Painted Photo", "Impression")
+CPU_STYLES = ("Canvas Oil", "Halftone", "Painted Photo", "Impression", "Oil Smear")
 
 CHOICES = {
     "paint_style": (PAINT_STYLES, "Brush Strokes"),

@@ -78,7 +78,7 @@ function syncDeps() {
 }
 
 /* Brush Strokes uses the Painting panel; Canvas Oil and Halftone have their own */
-const CPU_STYLES = ['Canvas Oil', 'Halftone', 'Painted Photo', 'Impression'];
+const CPU_STYLES = ['Canvas Oil', 'Halftone', 'Painted Photo', 'Impression', 'Oil Smear'];
 function syncStyle() {
   const sel = $('#f-paint_style');
   if (!sel) return;
@@ -86,11 +86,14 @@ function syncStyle() {
   const halftone = sel.value === 'Halftone';
   const painted = sel.value === 'Painted Photo';
   const impression = sel.value === 'Impression';
+  const oilSmear = sel.value === 'Oil Smear';
   $('#g-impression').hidden = !impression;
+  $('#g-smear').hidden = !oilSmear;
   $('#g-canvas-oil').hidden = !canvasOil;
   $('#g-halftone').hidden = !halftone;
   $('#g-painted').hidden = !painted;
-  $('#g-painting').hidden = canvasOil || halftone || painted || impression;
+  $('#g-painting').hidden = canvasOil || halftone || painted || impression || oilSmear;
+  $('#samples-wrap').hidden = !(canvasOil || halftone || painted || impression || oilSmear);
   $('#style-note').textContent = canvasOil
     ? 'Brush strokes over knife-cut patches, with canvas, scratches and speckles, like the Envato “Canvas Oil Painting” action. Photoshop is not needed. Set Brush Strokes to 0 for the fast, flat version.'
     : halftone
@@ -99,7 +102,9 @@ function syncStyle() {
         ? 'Flat, cut-out paint patches on kraft paper with a warm film look — like a hand-painted poster.'
         : impression
           ? 'Soft impressionist paint dabs with light strokes, bristle grooves and a woven canvas, inside a white border.'
-          : 'Real brush strokes, painted one at a time.';
+          : oilSmear
+            ? 'Flat oil paint dragged and smeared through thick, swirling paint strokes on a white painted ground.'
+            : 'Real brush strokes, painted one at a time.';
 }
 document.addEventListener('change', e => {
   if (e.target && e.target.id === 'f-paint_style') syncStyle();
@@ -812,8 +817,8 @@ function startPolling() {
       if (window.actionJobDone) window.actionJobDone();
       return;
     }
-    $('#stats').textContent = ['canvas_oil', 'halftone', 'painted', 'impression'].includes(s.engine)
-      ? `${{ halftone: 'Halftone', painted: 'Painted Photo', impression: 'Impression' }[s.engine] || 'Canvas Oil'} · ${s.seconds}s`
+    $('#stats').textContent = ['canvas_oil', 'halftone', 'painted', 'impression', 'smear'].includes(s.engine)
+      ? `${{ halftone: 'Halftone', painted: 'Painted Photo', impression: 'Impression', smear: 'Oil Smear' }[s.engine] || 'Canvas Oil'} · ${s.seconds}s`
       : `${s.strokes.toLocaleString()} strokes · ${s.seconds}s` + (s.stopped ? ' · stopped' : '');
     toast(s.stopped ? 'Stopped — the part that was painted is kept' : 'Painting finished', 'good');
   }, 420);
@@ -1011,6 +1016,10 @@ $('#ht-seed-random').onclick = () => {
   settingsChanged('ht_seed');
 };
 
+$('#sm-seed-random').onclick = () => {
+  $('#f-sm_seed').value = Math.floor(Math.random() * 10000);
+  settingsChanged('sm_seed');
+};
 $('#im-seed-random').onclick = () => {
   $('#f-im_seed').value = Math.floor(Math.random() * 10000);
   settingsChanged('im_seed');

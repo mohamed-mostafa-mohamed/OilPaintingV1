@@ -38,6 +38,7 @@ from . import canvas_oil
 from . import halftone
 from . import painted
 from . import impression
+from . import smear
 from .params import hex_to_bgr
 
 # --------------------------------------------------------------------------
@@ -390,9 +391,13 @@ def paint(image_bgr: np.ndarray, p: dict, progress=None, snapshots: int = 8,
     """
     from . import planner as pl
 
-    if p.get("paint_style") == "Canvas Oil":
+    from .params import SEED_KEYS
+    style = p.get("paint_style")
+    if style in SEED_KEYS and int(p.get("samples", 8)) > 1 and snapshots > 0:
+        return _paint_variations(image_bgr, p, progress, on_snapshot, should_stop)
+    if style == "Canvas Oil":
         return _paint_canvas_oil(image_bgr, p, progress, snapshots, on_snapshot)
-    if p.get("paint_style") in ("Halftone", "Painted Photo", "Impression"):
+    if style in ("Halftone", "Painted Photo", "Impression", "Oil Smear"):
         return _paint_halftone(image_bgr, p, progress, on_snapshot)
 
     t_start = time.time()
@@ -588,10 +593,45 @@ def paint_draft(image_bgr: np.ndarray, p: dict, cache=None, token=None):
     if p.get("paint_style") == "Canvas Oil":
         result, _, meta = _paint_canvas_oil(image_bgr, p, None, 0, None, draft=True)
         return meta["canvas"]
-    if p.get("paint_style") in ("Halftone", "Painted Photo", "Impression"):
-        return _halftone_bare(image_bgr, p)
+    if p.get("paint_style") in ("Halftone", "Painted Photo", "Impression", "Oil Smear"):
+        return _halftone_bare(image_bgr, p, draft=True)
     plan = pl.plan_preview(image_bgr, p, cache, token)
     return draft_strokes(plan, p)
+
+
+def _paint_variations(image_bgr, p, progress, on_snapshot, should_stop):
+    """The template styles: several variations of the same settings, each
+    with its own random seed (new strokes, smears, grain...), shown in the
+    Timeline one by one as they finish. The chosen seed is the last one, so
+    the result after a full Run is exactly the settings on screen."""
+    from .params import SEED_KEYS
+    t_start = time.time()
+    style = p.get("paint_style")
+    key = SEED_KEYS[style]
+    n = int(np.clip(int(p.get("samples", 8)), 1, 16))
+    base = int(p.get(key, 1))
+    shots, meta, stopped = [], None, False
+    for i in range(n):
+        q = dict(p)
+        q[key] = (base + i + 1) % 10000 if i < n - 1 else base
+
+        def report(f, label, i=i):
+            if progress:
+                progress((i + float(f)) / n, f"{label} — variation {i + 1} of {n}")
+        if style == "Canvas Oil":
+            result, _, meta = _paint_canvas_oil(image_bgr, q, report, 0, None)
+        else:
+            result, _, meta = _paint_halftone(image_bgr, q, report, None)
+        shots.append(result)
+        if on_snapshot:
+            on_snapshot(i, result)
+        if should_stop and should_stop() and i < n - 1:
+            stopped = True
+            break
+    meta = dict(meta)
+    meta["seconds"] = round(time.time() - t_start, 2)
+    meta["stopped"] = stopped
+    return shots[-1], shots, meta
 
 
 def _paint_canvas_oil(image_bgr, p, progress, snapshots, on_snapshot, draft=False):
@@ -661,15 +701,19 @@ def _paint_canvas_oil(image_bgr, p, progress, snapshots, on_snapshot, draft=Fals
                            "finish": ("blend",)}
 
 
-def _halftone_bare(image_bgr, p, progress=None):
+def _halftone_bare(image_bgr, p, progress=None, draft=False):
     src = image_bgr.astype(np.float32)
     work = src
     if p["abstract_enabled"]:
         if p["dist_strength"] > 0:
             work = ab.distort(work, p)
         work = ab.correct(work, p)
-    mod = {"Painted Photo": painted, "Impression": impression}.get(p.get("paint_style"), halftone)
-    return np.clip(mod.render(work, p, progress=progress), 0, 255).astype(np.float32)
+    mod = {"Painted Photo": painted, "Impression": impression, "Oil Smear": smear}.get(p.get("paint_style"), halftone)
+    if draft:      # live preview: made at the preview size itself (fast)
+        out = mod.render(work, p, progress=progress, min_side=0)
+    else:
+        out = mod.render(work, p, progress=progress)
+    return np.clip(out, 0, 255).astype(np.float32)
 
 
 def _paint_halftone(image_bgr, p, progress, on_snapshot):

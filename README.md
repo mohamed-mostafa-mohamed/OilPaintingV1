@@ -315,6 +315,39 @@ stroke mask; embossed bristle grooves and a woven canvas laid on with
 Overlay; and a white border. Sliders: Dabs, Swirl, Light Strokes, Relief,
 Canvas, Border. No brush, pattern or action file is used.
 
+## Oil Smear style (no Photoshop, no PSD, no texture files)
+
+**Painting style → Oil Smear** (`oilpaint/smear.py`) rebuilds the look of a
+"smeared oil paint" PSD template natively, measured against its layers: the
+photo is cleaned up like Oil Paint, posterized to 10 levels and cut out into
+flat patches, then dragged with Displace (30 % across, 60 % down) through a
+thick impasto stroke texture. The same texture is laid on with Overlay 57 %
+and a lighter copy with Multiply 27 %, then Vibrance -12 / Saturation +6, an
+S curve and Levels finish it (these last layers match the template to within
+one level). The stroke texture is generated in code, so every picture can be
+sold freely; **Random Seed** gives a new set of strokes. Sliders: Smear,
+Tones, Detail, Brush Relief, Texture, Direction (0 = strokes and smears
+run top to bottom, 100 = sideways), Curve (0 = straight lines, 100 = very
+curvy), Stroke Size, Contrast. Presets: *Oil Smear*, *Heavy
+Drag*, *Subtle*, *Big Strokes*, *Horizontal*, *Curvy Vertical*, *Curvy
+Horizontal*. Always made at full size (up to 4000 px).
+
+## Variations, live preview and Quality
+
+- **Variations** (Style panel): Canvas Oil, Halftone, Painted Photo,
+  Impression and Oil Smear make several versions per Run (default 8), each
+  with its own random seed; they appear in the timeline one by one (click
+  one to use it, Stop keeps the ones already made). The last one uses your
+  Random Seed. Batch makes one picture per photo.
+- **Live preview**: after a Run, these styles redraw live while you move
+  their sliders (about 900 px, 600 px while dragging; Oil Smear only redoes
+  the fast part for Smear / Texture / Contrast).
+- **Quality**: Max = the photo's own size (small photos are enlarged to at
+  least 2400 px; photos are kept up to 6000 px). High is always smaller than
+  Max and Normal smaller than High. Brush Strokes: 650 / 1000 / 1500 px /
+  Max. Template styles: 40 / 60 / 80 / 100 % of Max. Save writes the chosen
+  size.
+
 ## Actions (.atn) — played inside OilStudio, no Photoshop
 
 The **Actions (.atn)** panel plays real Photoshop actions (Envato packs or
@@ -421,6 +454,7 @@ oilpaint/canvas_oil.py  the Canvas Oil style (Envato look without Photoshop)
 oilpaint/halftone.py    the Halftone style (vintage halftone print)
 oilpaint/painted.py     the Painted Photo style (cut-out paint on kraft paper)
 oilpaint/impression.py  the Impression style (impressionist dabs on canvas)
+oilpaint/smear.py       the Oil Smear style (paint smeared through thick strokes)
 oilpaint/decoration.py  studio light, canvas surfaces, frames, text
 oilpaint/brushes.py     Smudge, History, Oil and 3D post-processing brushes
 oilpaint/presets.py     built-in presets and the user's saved ones
