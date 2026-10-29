@@ -164,6 +164,71 @@ _TONE_X = np.array([0, 16, 48, 80, 112, 144, 176, 208, 240, 255], np.float32) / 
 _TONE_Y = np.array([30, 45.5, 68.9, 94.0, 115.6, 142.9, 171.5, 203.9, 235.5, 250], np.float32) / 255
 
 
+def pct_small(x, q):
+    """Percentile of a picture, read from a copy at most 256 px long (the
+    GPU reads the same small copy back, so both use the same number)."""
+    h, w = x.shape[:2]
+    k = min(1.0, 256.0 / max(h, w))
+    if k < 1.0:
+        x = cv2.resize(x, (max(1, int(round(w * k))), max(1, int(round(h * k)))), interpolation=cv2.INTER_AREA)
+    return float(np.percentile(x, q))
+
+
+def flow_n(lum, s, sw_noise, swirl=0.5):
+    """flow() with its swirl noise given (see textures())."""
+    gx = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
+    sig = 10 * s + 1
+    jxx, jyy, jxy = _g(gx * gx, sig), _g(gy * gy, sig), _g(gx * gy, sig)
+    ang2 = np.arctan2(2 * jxy, jxx - jyy) + np.pi
+    tr = jxx + jyy
+    coh = np.sqrt((jxx - jyy) ** 2 + 4 * jxy ** 2) / (tr + 1e-6)
+    strength = np.clip(coh * np.clip(tr / (pct_small(tr, 90) + 1e-6), 0, 1) * 1.6, 0, 1)
+    sw = sw_noise * math.pi * (0.6 + 0.8 * swirl) + 0.6
+    c2 = strength * np.cos(ang2) + (1 - strength) * np.cos(2 * sw)
+    s2 = strength * np.sin(ang2) + (1 - strength) * np.sin(2 * sw)
+    c2, s2 = _g(c2, 3 * s + 0.5), _g(s2, 3 * s + 0.5)
+    a = 0.5 * np.arctan2(s2, c2)
+    return np.cos(a).astype(np.float32), np.sin(a).astype(np.float32)
+
+
+# --------------------------------------------------------------------------
+# the random textures (no photo needed) - also sent to the GPU
+# --------------------------------------------------------------------------
+ASSET_NAMES = ()
+
+
+def tex_key(p):
+    return (int(p.get("im_seed", 5)), float(p.get("im_light", 50)) > 0,
+            float(p.get("im_relief", 50)) > 0, float(p.get("im_canvas", 50)) > 0)
+
+
+def textures(h, w, p):
+    """Every random field of the look, drawn in the same order as before."""
+    s = max(h, w) / REF_SIDE
+    seed = int(p.get("im_seed", 5))
+    rng = np.random.default_rng(seed)
+    hs, ws = max(8, h // 2), max(8, w // 2)
+    t = {"swirl": _noise((hs, ws), 90 * (s / 2) + 2, rng)}
+    for i in range(7):
+        t[f"dx{i}"] = _noise((hs, ws), 1.5, rng)
+        t[f"dy{i}"] = _noise((hs, ws), 1.5, rng)
+    t["mod"] = np.clip(0.5 + 0.6 * cv2.resize(_noise((max(4, h // 8), max(4, w // 2)), 1.0, rng), (w, h)), 0, 1.3)
+    t["rid"] = _noise((hs, ws), 0.6, rng)
+    if float(p.get("im_light", 50)) > 0:
+        t["mask"] = _noise((hs, ws), 1.2, rng)
+    if float(p.get("im_relief", 50)) > 0:
+        t["bump"] = bump_layer(h, w, s, np.random.default_rng(seed + 77), 1.0)
+    if float(p.get("im_canvas", 50)) > 0:
+        t["canvas"] = canvas_layer(h, w, s, np.random.default_rng(seed + 91), 1.0)
+    return t
+
+
+def look_payload():
+    return {"ref_side": REF_SIDE, "min_side": MIN_SIDE, "textures": True,
+            "tone_x": _TONE_X.tolist(), "tone_y": _TONE_Y.tolist()}
+
+
 def render(image_bgr: np.ndarray, p: dict, progress=None, min_side: int = MIN_SIDE) -> np.ndarray:
     h0, w0 = image_bgr.shape[:2]
     if max(h0, w0) < min_side:
@@ -179,20 +244,25 @@ def render(image_bgr: np.ndarray, p: dict, progress=None, min_side: int = MIN_SI
 
     rgb = np.ascontiguousarray(np.asarray(image_bgr, np.float32)[..., ::-1]) / 255.0
     h, w = rgb.shape[:2]
+    report(0.05, "Impression: textures")
+    return apply(rgb, textures(h, w, p), p, report)
+
+
+def apply(rgb, t, p, report=lambda f, x: None):
+    """The photo steps (the GPU runs the same ones, static/js/oilfx.js)."""
+    h, w = rgb.shape[:2]
     s = max(h, w) / REF_SIDE
-    seed = int(p.get("im_seed", 5))
-    rng = np.random.default_rng(seed)
     dab = float(p.get("im_dab", 50)) / 50.0
     light_amt = float(p.get("im_light", 50)) / 50.0
     relief = float(p.get("im_relief", 50)) / 50.0
     canvas = float(p.get("im_canvas", 50)) / 50.0
 
     # ---- 1. flow (made at half size, it is smooth) --------------------------
-    report(0.05, "Impression: stroke directions")
+    report(0.10, "Impression: stroke directions")
     hs, ws = max(8, h // 2), max(8, w // 2)
     small = cv2.resize(rgb, (ws, hs), interpolation=cv2.INTER_AREA)
     lum_s = F.lum(small)
-    fdx, fdy = flow(lum_s, s / 2, rng, float(p.get("im_swirl", 50)) / 100.0)
+    fdx, fdy = flow_n(lum_s, s / 2, t["swirl"], float(p.get("im_swirl", 50)) / 100.0)
 
     # ---- 2. dabs: median of several dab-shuffled copies (like a stack of
     #      Art History brush layers), then the sharpening and tone ------------
@@ -201,9 +271,9 @@ def render(image_bgr: np.ndarray, p: dict, progress=None, min_side: int = MIN_SI
     gy, gx = np.mgrid[0:hs, 0:ws].astype(np.float32)
     amp = 7.0 * s * dab
     copies = []
-    for _ in range(7):
-        nx = lic(_noise((hs, ws), 1.5, rng), fdx, fdy, 5, 4)
-        ny = lic(_noise((hs, ws), 1.5, rng), fdx, fdy, 5, 4)
+    for i in range(7):
+        nx = lic(t[f"dx{i}"], fdx, fdy, 5, 4)
+        ny = lic(t[f"dy{i}"], fdx, fdy, 5, 4)
         nx /= nx.std() + 1e-6
         ny /= ny.std() + 1e-6
         copies.append(cv2.remap(pre, gx + nx * amp, gy + ny * amp, cv2.INTER_LINEAR,
@@ -217,29 +287,27 @@ def render(image_bgr: np.ndarray, p: dict, progress=None, min_side: int = MIN_SI
     report(0.35, "Impression: brush texture")
     # fine vertical weave the dabs pick up from the canvas
     xx = np.arange(w, dtype=np.float32)[None, :]
-    mod = np.clip(0.5 + 0.6 * cv2.resize(_noise((max(4, h // 8), max(4, w // 2)), 1.0, rng), (w, h)), 0, 1.3)
-    stripe = np.sin(2 * math.pi * xx / (5.75 * s + 0.4)) * mod
+    stripe = np.sin(2 * math.pi * xx / (5.75 * s + 0.4)) * t["mod"]
     base = base * (1 + stripe[..., None] * 0.012 * relief)
     # bristle ripples along the strokes, mostly in the light paint
-    rid = lic(_noise((hs, ws), 0.6, rng), fdx, fdy, 6 * s + 1, 4)
+    rid = lic(t["rid"], fdx, fdy, 6 * s + 1, 4)
     rid = cv2.resize(rid, (w, h), interpolation=cv2.INTER_CUBIC)
     rid /= rid.std() + 1e-6
     lg = F.lum(_g(rgb, 1.5 * s))
     det = np.sqrt(cv2.Sobel(lg, cv2.CV_32F, 1, 0) ** 2 + cv2.Sobel(lg, cv2.CV_32F, 0, 1) ** 2)
-    det = np.clip(_g(det, 12 * s + 1) / (np.percentile(det, 80) + 1e-6), 0, 1)   # where the photo has detail
+    det = np.clip(_g(det, 12 * s + 1) / (pct_small(det, 80) + 1e-6), 0, 1)   # where the photo has detail
     base = base * (1 + (_emboss(rid, 135, 1.0) * det * (0.4 + 0.8 * L))[..., None] * 0.035 * relief)
     # Unsharp Mask x2 (181% r2.8, 101% r1.6)
     base = _unsharp(base, 1.81, 2.8 * s)
     effect = np.clip(_unsharp(base, 1.01, 1.6 * s), 0, 1)
 
     # ---- 3. light strokes (Lighten through a ragged stroke mask) -------------
-    if light_amt > 0:
+    if light_amt > 0 and "mask" in t:
         report(0.5, "Impression: light strokes")
         longs = lic(small, fdx, fdy, length=28 * s + 2, steps=10)
         longs = cv2.resize(longs, (w, h), interpolation=cv2.INTER_CUBIC)
         longs = np.clip(longs * 0.93, 0, 1)            # this layer is a little darker
-        m = _noise((hs, ws), 1.2, rng)
-        m = lic(m, fdx, fdy, length=14 * s + 1, steps=6)
+        m = lic(t["mask"], fdx, fdy, length=14 * s + 1, steps=6)
         m = cv2.resize(m, (w, h), interpolation=cv2.INTER_CUBIC)
         m = m / (m.std() + 1e-6)
         cover = np.clip((m + 0.85) * 2.2, 0, 1) * min(1.0, light_amt)
@@ -249,12 +317,12 @@ def render(image_bgr: np.ndarray, p: dict, progress=None, min_side: int = MIN_SI
     # ---- 4. surface: bristle grooves + woven canvas (Overlay) ---------------
     report(0.75, "Impression: canvas")
     x = effect
-    if relief > 0:
-        bump = bump_layer(h, w, s, np.random.default_rng(seed + 77), relief)
+    if relief > 0 and "bump" in t:
+        bump = 0.5 + (t["bump"] - 0.5) * relief
         bump = 0.5 + (bump - 0.5) * (0.4 + 0.6 * F.lum(rgb))      # deeper in light paint
         x = F.blend("Ovrl", x, np.repeat(bump[..., None], 3, axis=2))
-    if canvas > 0:
-        cv = canvas_layer(h, w, s, np.random.default_rng(seed + 91), canvas)
+    if canvas > 0 and "canvas" in t:
+        cv = 0.5 + (t["canvas"] - 0.5) * canvas
         x = F.blend("Ovrl", x, np.repeat(cv[..., None], 3, axis=2))
 
     # ---- 5. border -----------------------------------------------------------

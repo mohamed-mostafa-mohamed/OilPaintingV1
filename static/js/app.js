@@ -21,7 +21,8 @@ const state = {
    image falls back to server-rendered previews of the finishing and
    decoration settings.                                                   */
 const live = new window.OilLive.Live();
-const liveOn = () => live.supported && live.active;
+/* live.ok is false while the GPU context is lost: everything uses the server then */
+const liveOn = () => live.ok && live.active;
 
 /* ---------------------------------------------------------------- toast */
 let toastTimer;
@@ -78,7 +79,11 @@ function syncDeps() {
 }
 
 /* Brush Strokes uses the Painting panel; Canvas Oil and Halftone have their own */
-const CPU_STYLES = ['Canvas Oil', 'Halftone', 'Painted Photo', 'Impression', 'Oil Smear'];
+const CPU_STYLES = ['Canvas Oil', 'Halftone', 'Painted Photo', 'Impression', 'Oil Smear', 'Oil Paint FX',
+  'Sketch Paint', 'Rough Brush', 'Watercolor', 'Silk Oil'];
+/* filter styles the GPU can make itself (static/js/oilfx.js) */
+const FX_STYLE = 'Oil Paint FX', SKETCH_STYLE = 'Sketch Paint', ROUGH_STYLE = 'Rough Brush', WATER_STYLE = 'Watercolor';
+const gpuFilterStyle = s => !!(window.OilFX && window.OilFX.has(s));
 function syncStyle() {
   const sel = $('#f-paint_style');
   if (!sel) return;
@@ -87,15 +92,26 @@ function syncStyle() {
   const painted = sel.value === 'Painted Photo';
   const impression = sel.value === 'Impression';
   const oilSmear = sel.value === 'Oil Smear';
+  const oilFx = sel.value === FX_STYLE;
+  const sketch = sel.value === SKETCH_STYLE;
+  const rough = sel.value === ROUGH_STYLE;
+  const water = sel.value === WATER_STYLE;
+  const silk = sel.value === 'Silk Oil';
+  $('#g-silk').hidden = !silk;
+  $('#g-rough').hidden = !rough;
+  $('#g-water').hidden = !water;
+  $('#g-oilfx').hidden = !oilFx;
+  $('#g-sketch').hidden = !sketch;
   $('#g-impression').hidden = !impression;
   $('#g-smear').hidden = !oilSmear;
   $('#g-canvas-oil').hidden = !canvasOil;
   $('#g-halftone').hidden = !halftone;
   $('#g-painted').hidden = !painted;
-  $('#g-painting').hidden = canvasOil || halftone || painted || impression || oilSmear;
-  $('#samples-wrap').hidden = !(canvasOil || halftone || painted || impression || oilSmear);
-  $('#style-note').textContent = canvasOil
-    ? 'Brush strokes over knife-cut patches, with canvas, scratches and speckles, like the Envato “Canvas Oil Painting” action. Photoshop is not needed. Set Brush Strokes to 0 for the fast, flat version.'
+  $('#g-painting').hidden = canvasOil || halftone || painted || impression || oilSmear || oilFx || sketch || rough || water || silk;
+  $('#style-note').textContent = silk
+    ? 'Soft oil smears with fine bristle streaks, an impasto texture and a diagonal light, from a Photoshop template. Runs on the GPU or the CPU.'
+    : canvasOil
+    ? 'Knife-cut paint patches dragged into brush strokes, with sketch lines, canvas, scratches and speckles, like the Envato “Canvas Oil Painting” action. Made on the graphics card in a moment. Set Brush Strokes to 0 for flat knife patches.'
     : halftone
       ? 'A vintage halftone print: sepia ink, stipple grain, a woven dot grid and light scratches. Pick your own ink and paper colours below.'
       : painted
@@ -104,7 +120,15 @@ function syncStyle() {
           ? 'Soft impressionist paint dabs with light strokes, bristle grooves and a woven canvas, inside a white border.'
           : oilSmear
             ? 'Flat oil paint dragged and smeared through thick, swirling paint strokes on a white painted ground.'
-            : 'Real brush strokes, painted one at a time.';
+            : oilFx
+              ? 'Photoshop-style oil-paint filters: smooth paint, inked edges, a cracked texture and a grunge edge over a warm yellow ground. Runs on the GPU or the CPU.'
+              : sketch
+                ? 'Blotchy poster paint with dark edges, a pencil-sketch texture and ink outlines. Runs on the GPU or the CPU.'
+                : rough
+                  ? 'Thick oil paint dragged into rough, sweeping brush strokes with a canvas-brush texture. Runs on the GPU or the CPU.'
+                  : water
+                    ? 'Watercolour washes and blotches inside a ragged brush-edge frame on cream paper. Set Frame to 0 to fill the page. Runs on the GPU or the CPU.'
+                    : 'Real brush strokes, painted one at a time.';
 }
 document.addEventListener('change', e => {
   if (e.target && e.target.id === 'f-paint_style') syncStyle();
@@ -210,7 +234,8 @@ function updatePreviewBadge() {
   }
   const lm = $('#live-mode');
   if (lm) lm.textContent = !state.painted ? '' :
-    (liveOn() ? '⚡ Live sliders: GPU' : (live.supported ? '' : 'Live sliders: server (no WebGL 2)'));
+    (liveOn() ? '⚡ Live · GPU' : live.lost ? 'Live · server (GPU reconnecting…)' :
+     (live.supported ? '' : 'Live · server (no WebGL 2)'));
   badge.hidden = !previewing;
   badge.textContent = text;
   badge.classList.toggle('busy', liveOn() && live.busy);
@@ -222,6 +247,15 @@ live.onChange(what => {
     const [ow, oh] = state.natural.after;
     state.natural.after = [w, h];
     if (state.tab === 'after' && (w !== ow || h !== oh)) { if (state.fit) fitZoom(); else applyZoom(); }
+  }
+  if (what === 'lost') {
+    /* show the server-rendered After image until the GPU comes back */
+    toast('The graphics card disconnected — using the CPU until it is back.', 'bad');
+    if (state.painted && !state.running) refreshAfter(); else updateView();
+  }
+  if (what === 'restored') {
+    toast('Graphics card reconnected', 'good');
+    if (state.painted && !state.running) refreshAfter();
   }
   updatePreviewBadge();
 });
@@ -276,7 +310,7 @@ const IMAGE_EXT = /\.(jpe?g|png|bmp|webp|tiff?)$/i;
 
 async function openImage(file) {
   if (!file) return;
-  if (!IMAGE_EXT.test(file.name)) { toast('That is not an image OilStudio can open (JPG, PNG, BMP, WEBP, TIFF).', 'bad'); return; }
+  if (!IMAGE_EXT.test(file.name)) { toast('That is not an image DOOD Studio can open (JPG, PNG, BMP, WEBP, TIFF).', 'bad'); return; }
   if (state.running) { toast('Wait for the painting to finish, or press Stop.', 'bad'); return; }
   const fd = new FormData();
   fd.append('image', file);
@@ -291,6 +325,8 @@ async function openImage(file) {
     $('#btn-snapshot').disabled = true;
     $('#img-after').hidden = true;
     $('#stats').textContent = `${r.width} × ${r.height}`;
+    $('#frame-name').textContent = r.name || 'Photo';
+    $('#frame-size').textContent = `${r.width} × ${r.height}`;
     setTab('before');
     refreshBefore();
     renderShots([], -1);
@@ -350,7 +386,7 @@ async function refreshAfter() {
     const st = await api('/api/live/state');
     state.ranKey = st.ran ? window.OilLive.strokeKey(st.ran) : null;
   } catch { state.ranKey = null; }
-  if (live.supported) {
+  if (live.ok) {
     try {
       live.params = collect(); live.order = decoOrder();
       if (await live.load()) { showAfterView(); updatePreviewBadge(); return; }
@@ -452,7 +488,7 @@ window.addEventListener('resize', () => { if (state.fit) fitZoom(); });
 
 /* the mouse wheel zooms, Ctrl or not */
 $('#canvas-wrap').addEventListener('wheel', e => {
-  if (!state.open) return;
+  if (!state.open || e.target.closest('.toolbar')) return;
   e.preventDefault();
   zoomAt((state.zoom || 1) * Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
 }, { passive: false });
@@ -476,7 +512,7 @@ function startPan(e) {
   window.addEventListener('pointercancel', up);
 }
 $('#canvas-wrap').addEventListener('pointerdown', e => {
-  if (!state.open || e.target.closest('.peek')) return;
+  if (!state.open || e.target.closest('.peek, .toolbar')) return;
   if (e.button === 1 || (e.button === 0 && panReady())) {
     e.preventDefault(); e.stopPropagation();
     startPan(e);
@@ -507,6 +543,12 @@ function setTab(tab) {
   updateView();
   $$('.tool.before-only').forEach(b => b.style.display = tab === 'before' ? '' : 'none');
   $$('.tool.after-only').forEach(b => b.style.display = tab === 'after' ? '' : 'none');
+  /* the dock: no two separators next to each other */
+  let lastSep = true;
+  $$('#toolbar > *').forEach(el => {
+    if (el.classList.contains('tsep')) { el.style.display = lastSep ? 'none' : ''; lastSep = true; }
+    else if (el.style.display !== 'none') lastSep = false;
+  });
   const t = state.tool;
   /* Split is for looking: the Hand and Zoom tools only */
   if ((tab === 'before' && window.TOOLS[t]) ||
@@ -691,7 +733,7 @@ async function sendBrush(path) {
 
 /* ----------------------------------------------------------------- run */
 /* Paint on: GPU (fast) or CPU (finest bristle detail) - remembered */
-const paintOnGpu = () => live.supported && $('#paint-on').value === 'gpu' &&
+const paintOnGpu = () => live.ok && $('#paint-on').value === 'gpu' &&
   !CPU_STYLES.includes(collect().paint_style);
 (() => {
   const sel = $('#paint-on');
@@ -702,64 +744,165 @@ const paintOnGpu = () => live.supported && $('#paint-on').value === 'gpu' &&
 
 /* Run on the graphics card: the server plans the strokes, the GPU paints
    them at full size, the server finishes the picture */
-async function gpuRun() {
-  const p = collect(), quality = $('#quality').value;
-  state.running = true; state.gpuStop = false;
+/* ---- GPU Runs ---------------------------------------------------------
+   Stop ends a GPU Run at once: requests in flight are dropped and the
+   graphics card stops at its next step. Each finished variation goes into
+   the Timeline straight away, not all at the end. */
+function gpuRunStart() {
+  const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  if (state.abort) state.abort.abort();
+  state.abort = new AbortController();
+  state.runId = id; state.gpuStop = false; state.running = true;
   $('#btn-run').disabled = true; $('#btn-stop').disabled = false;
   $('#btn-run').classList.remove('pulse');
   $('#progress').hidden = false;
-  const bar = f => { $('#bar-fill').style.width = Math.round(f * 100) + '%'; };
-  const label = t => { $('#bar-label').textContent = t; };
-  const done = () => {
-    state.running = false;
-    $('#btn-run').disabled = false; $('#btn-stop').disabled = true;
-    $('#progress').hidden = true;
+  let ended = false;
+  const run = {
+    id, signal: state.abort.signal,
+    stopped: () => state.gpuStop || state.runId !== id,
+    bar: f => { if (!run.stopped()) $('#bar-fill').style.width = Math.round(f * 100) + '%'; },
+    label: t => { if (!run.stopped()) $('#bar-label').textContent = t; },
+    /* the UI back to idle (once) */
+    end: () => {
+      if (ended) return false;
+      ended = true;
+      if (state.runId === id) {
+        state.running = false; state.onStop = null;
+        if (!state.autoPending) live.holdPreview = false;
+        $('#btn-run').disabled = false; $('#btn-stop').disabled = true;
+        $('#progress').hidden = true;
+      }
+      return true;
+    },
+    stop: () => { if (run.end()) toast('Stopped — the previous painting is kept'); },
+    /* a finished variation straight into the Timeline */
+    take: async (blob, finish) => {
+      const fd = new FormData();
+      fd.append('image', blob, 'take.png'); fd.append('run', id); fd.append('finish', finish);
+      const r = await fetch('/api/take', { method: 'POST', body: fd, signal: run.signal });
+      if (!r.ok || run.stopped()) return;
+      const s = await api('/api/progress');
+      shotIds = '';
+      renderShots(s.shots, s.selected);
+    },
+    /* an error: Stop pressed, or a real problem -> the CPU instead */
+    fail: (err, where) => {
+      if (run.stopped() || (err && err.name === 'AbortError')) return run.stop();
+      run.end();
+      window.logGpu && window.logGpu(where, err);
+      toast(err.message + ' — making it on the CPU instead.', 'bad');
+      cpuRun();
+    },
+    finished: async (r, statsText) => {
+      run.end();
+      state.painted = true; state.version = r.version;
+      $('#btn-export').disabled = false; $('#btn-snapshot').disabled = false;
+      shotIds = '';
+      const s = await api('/api/progress');
+      renderShots(s.shots, s.selected);
+      setTab('after');
+      refreshAfter();
+      $('#stats').textContent = statsText;
+      toast('Painting finished', 'good');
+    }
   };
+  state.onStop = run.stop;
+  /* the last Run's shots leave the Timeline, like on a CPU Run */
+  fetch('/api/take/clear', { method: 'POST' })
+    .then(() => api('/api/progress')).then(s => { shotIds = ''; renderShots(s.shots, s.selected); }).catch(() => {});
+  return run;
+}
+
+async function gpuRun() {
+  const p = collect(), quality = $('#quality').value, tAll = performance.now();
+  const run = gpuRunStart();
   try {
-    bar(0.04); label('Planning the strokes');
-    const res = await fetch('/api/gpu/plan', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ params: p, quality, deco_order: decoOrder() })
-    });
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Planning failed');
-    const plan = window.OilLive.parsePlan(await res.arrayBuffer());
-    label(`Painting ${plan.n.toLocaleString()} strokes on the graphics card`);
-    const out = await live.paintFull(plan, p, {
-      snapshots: 8, shouldStop: () => state.gpuStop,
-      onProgress: f => bar(0.15 + 0.7 * f)
-    });
-    if (!out) { done(); toast('Stopped — the previous painting is kept'); return; }
-    bar(0.9); label('Finishing');
+    /* Variations: the same settings with other Random Seeds, painted first;
+       the settings on screen are painted last (its plan stays on the server) */
+    const n = Math.max(1, Math.min(16, Number(p.samples) || 1));
+    const base = Number(p.random_seed) || 0;
+    let out = null;
+    for (let i = 0; i < n; i++) {
+      const last = i === n - 1;
+      const q = Object.assign({}, p, { random_seed: last ? base : (base + i + 1) % 10000 });
+      const part = f => run.bar(0.04 + 0.86 * (i + f) / n);
+      part(0); run.label(n > 1 ? `Variation ${i + 1} of ${n}: planning the strokes` : 'Planning the strokes');
+      const res = await fetch('/api/gpu/plan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: run.signal,
+        body: JSON.stringify({ params: q, quality, deco_order: decoOrder() })
+      });
+      if (run.stopped()) return run.stop();
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Planning failed');
+      const plan = window.OilLive.parsePlan(await res.arrayBuffer());
+      run.label(n > 1 ? `Variation ${i + 1} of ${n}: ${plan.n.toLocaleString()} strokes on the graphics card`
+        : `Painting ${plan.n.toLocaleString()} strokes on the graphics card`);
+      out = await live.paintFull(plan, q, {
+        snapshots: n > 1 ? 0 : 8, shouldStop: run.stopped,
+        onProgress: f => part(0.15 + 0.85 * f)
+      });
+      if (!out || run.stopped()) return run.stop();
+      if (!last) await run.take(out.canvas, 'brush');
+    }
+    run.bar(0.9); run.label('Finishing');
     const fd = new FormData();
     fd.append('canvas', out.canvas, 'canvas.png');
     fd.append('height', new Blob([out.height.buffer]), 'height.f16');
-    out.shots.forEach((b, i) => fd.append('shots', b, `shot${i}.jpg`));
+    out.shots.forEach((b, i) => fd.append('shots', b, `shot${i}.png`));
     fd.append('seconds', String(out.seconds));
-    const r = await api('/api/gpu/result', { method: 'POST', body: fd });
-    done();
-    state.painted = true;
-    state.version = r.version;
-    $('#btn-export').disabled = false;
-    $('#btn-snapshot').disabled = false;
-    shotIds = '';
-    const s = await api('/api/progress');
-    renderShots(s.shots, s.selected);
-    setTab('after');
-    refreshAfter();
-    $('#stats').textContent = `${r.strokes.toLocaleString()} strokes · ${r.seconds}s · GPU`;
-    toast('Painting finished', 'good');
-  } catch (err) {
-    done();
-    toast(err.message + ' — painting on the CPU instead.', 'bad');
-    cpuRun();
-  }
+    fd.append('run', run.id);
+    const r = await api('/api/gpu/result', { method: 'POST', body: fd, signal: run.signal });
+    if (run.stopped()) return run.stop();
+    await run.finished(r, `${r.strokes.toLocaleString()} strokes` + (n > 1 ? ` · ${n} variations` : '') +
+      ` · ${((performance.now() - tAll) / 1000).toFixed(1)}s · GPU`);
+  } catch (err) { run.fail(err, 'gpu run ' + p.paint_style); }
 }
 
 $('#btn-run').onclick = async () => {
   if (!state.open || state.running) return;
   if (state.painted) await flushSync();
-  if (paintOnGpu()) gpuRun(); else cpuRun();
+  if (fxOnGpu()) fxGpuRun();
+  else if (paintOnGpu()) gpuRun(); else cpuRun();
 };
+
+/* the filter styles on the graphics card: the server sizes the photo, the
+   GPU runs the filters (static/js/oilfx.js), the server keeps the result */
+const fxOnGpu = () => live.ok && window.OilFX && window.OilFX.ok &&
+  $('#paint-on').value === 'gpu' && gpuFilterStyle(collect().paint_style);
+async function fxGpuRun() {
+  const p = collect(), quality = $('#quality').value, name = p.paint_style;
+  const run = gpuRunStart();
+  const t0 = performance.now();
+  try {
+    run.bar(0.05); run.label(name + ': preparing the photo');
+    const res = await fetch('/api/fx/prepare', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: run.signal,
+      body: JSON.stringify({ params: p, quality, deco_order: decoOrder() })
+    });
+    if (run.stopped()) return run.stop();
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Preparing failed');
+    const src = await createImageBitmap(await res.blob(), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+    if (run.stopped()) return run.stop();
+    /* Variations: each with its own seed; the settings on screen come last */
+    const n = Math.max(1, Math.min(16, Number(p.samples) || 1));
+    const key = window.OilFX.SEED_KEY[name], base = Number(p[key]) || 0;
+    let px = null;
+    for (let i = 0; i < n; i++) {
+      const last = i === n - 1;
+      const q = Object.assign({}, p, { [key]: last ? base : (base + i + 1) % 10000 });
+      run.label(n > 1 ? `${name}: variation ${i + 1} of ${n} on the graphics card` : `${name}: filters on the graphics card`);
+      px = await window.OilFX.run(src, q, f => run.bar(0.12 + 0.76 * (i + f) / n), { source: 'run', shouldStop: run.stopped });
+      if (run.stopped()) return run.stop();
+      if (!last) await run.take(await window.OilFX.toBlob(px, src.width, src.height, 'image/png'), 'filter');
+    }
+    run.bar(0.9); run.label('Finishing');
+    const fd = new FormData();
+    fd.append('canvas', await window.OilFX.toBlob(px, src.width, src.height), 'canvas.png');
+    fd.append('run', run.id);
+    const r = await api('/api/fx/result', { method: 'POST', body: fd, signal: run.signal });
+    if (run.stopped()) return run.stop();
+    await run.finished(r, `${name}` + (n > 1 ? ` · ${n} variations` : '') + ` · ${((performance.now() - t0) / 1000).toFixed(1)}s · GPU`);
+  } catch (err) { run.fail(err, 'fx run ' + name); }
+}
 
 async function cpuRun() {
   try {
@@ -778,8 +921,14 @@ async function cpuRun() {
   } catch (err) { toast(err.message, 'bad'); }
 };
 
+/* Stop: a GPU Run ends at once; a CPU Run is told to stop (the server lets
+   it go if it does not stop within a moment) */
 $('#btn-stop').onclick = () => {
   state.gpuStop = true;
+  if (state.abort) state.abort.abort();
+  const f = state.onStop; state.onStop = null;
+  if (f) f();
+  else { $('#bar-label').textContent = 'Stopping…'; $('#btn-stop').disabled = true; }
   api('/api/stop', { method: 'POST' }).catch(() => {});
 };
 
@@ -795,6 +944,7 @@ function startPolling() {
 
     clearInterval(state.poll);
     state.running = false;
+    if (!state.autoPending) live.holdPreview = false;
     $('#btn-run').disabled = false;
     $('#btn-stop').disabled = true;
     $('#progress').hidden = true;
@@ -817,8 +967,10 @@ function startPolling() {
       if (window.actionJobDone) window.actionJobDone();
       return;
     }
-    $('#stats').textContent = ['canvas_oil', 'halftone', 'painted', 'impression', 'smear'].includes(s.engine)
-      ? `${{ halftone: 'Halftone', painted: 'Painted Photo', impression: 'Impression', smear: 'Oil Smear' }[s.engine] || 'Canvas Oil'} · ${s.seconds}s`
+    $('#stats').textContent = ['canvas_oil', 'halftone', 'painted', 'impression', 'smear', 'oilfx', 'sketchfx', 'brushfx', 'watercolor', 'silkoil'].includes(s.engine)
+      ? `${{ silkoil: 'Silk Oil', halftone: 'Halftone', painted: 'Painted Photo', impression: 'Impression', smear: 'Oil Smear', oilfx: FX_STYLE, sketchfx: SKETCH_STYLE, brushfx: ROUGH_STYLE, watercolor: WATER_STYLE }[s.engine] || 'Canvas Oil'} · ${s.seconds}s` +
+        /* these styles have no GPU version: say so when GPU was picked */
+        (!gpuFilterStyle(collect().paint_style) && live.ok && $('#paint-on').value === 'gpu' ? ' · CPU (no GPU for this style)' : ' · CPU')
       : `${s.strokes.toLocaleString()} strokes · ${s.seconds}s` + (s.stopped ? ' · stopped' : '');
     toast(s.stopped ? 'Stopped — the part that was painted is kept' : 'Painting finished', 'good');
   }, 420);
@@ -916,11 +1068,45 @@ window.addEventListener('keyup', e => {
 window.addEventListener('blur', () => { state.space = false; setPeek(false); updatePanCursor(); });
 
 /* -------------------------------------------------------------- export */
+/* Save a file. In the desktop app the native Save dialog is used (macOS's
+   WebKit window ignores browser downloads, Windows allows them); in a
+   normal browser it is an ordinary download. */
+async function saveBlob(blob, name) {
+  const bridge = window.pywebview && window.pywebview.api && window.pywebview.api.save_file;
+  if (bridge) {
+    const b64 = await new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result).split(',')[1] || '');
+      fr.onerror = () => reject(fr.error);
+      fr.readAsDataURL(blob);
+    });
+    const r = await window.pywebview.api.save_file(name, b64);
+    if (r && r.ok) toast('Saved — ' + r.path, 'good');
+    else if (r && r.error) toast('Could not save: ' + r.error, 'bad');
+    return !!(r && r.ok);
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  return true;
+}
+function fileNameOf(res, fallback) {
+  const cd = res.headers.get('content-disposition') || '';
+  const m = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(cd);
+  return m ? decodeURIComponent(m[1] || m[2]) : fallback;
+}
 $('#btn-export').onclick = async () => {
   await flushSync();
   if (liveOn() && live.previewing)
-    toast('Saved the last Run. The new stroke settings are only a preview — press Run to paint them.');
-  window.location = '/api/export?format=' + $('#export-format').value;
+    toast('Saving the last Run. The new stroke settings are only a preview — press Run to paint them.');
+  try {
+    const fmt = $('#export-format').value;
+    const res = await fetch('/api/export?format=' + fmt, { cache: 'no-store' });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Saving failed');
+    await saveBlob(await res.blob(), fileNameOf(res, 'painting.' + fmt));
+  } catch (err) { toast(err.message, 'bad'); }
 };
 
 $('#file-batch').addEventListener('change', async e => {
@@ -942,37 +1128,118 @@ $('#file-batch').addEventListener('change', async e => {
     }
     const blob = await res.blob();
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'oil_paintings.zip';
-    a.click();
+    await saveBlob(blob, 'paintings.zip');
     URL.revokeObjectURL(a.href);
     toast('Batch finished', 'good');
   } catch (err) { toast(err.message, 'bad'); }
 });
 
 /* ------------------------------------------------------------- presets */
+/* Two pickers: Style (Canvas Oil, Halftone, ...) then its Setup (Fine,
+   Loose, ...).  "Oil Smear - Subtle" -> style "Oil Smear", setup "Subtle";
+   "AKV Portrait" -> style "Classic (AKV)", setup "Portrait".             */
+const MY_PRESETS = 'My presets';
+const presetGroups = new Map();          /* style -> [{ name, label }] */
+let userPresets = new Set();
+function splitPreset(name) {
+  const i = name.indexOf(' - ');
+  if (i > 0) return [name.slice(0, i), name.slice(i + 3)];
+  if (name.startsWith('AKV ')) return ['Classic (AKV)', name.slice(4)];
+  return [name, 'Default'];
+}
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
 async function loadPresets(select) {
   const d = await api('/api/presets');
-  const sel = $('#preset-list');
-  sel.innerHTML =
-    '<optgroup label="Built-in">' +
-    d.builtin.map(n => `<option>${n}</option>`).join('') + '</optgroup>' +
-    (d.user.length ? '<optgroup label="My presets">' +
-      d.user.map(n => `<option>${n}</option>`).join('') + '</optgroup>' : '');
-  if (select) sel.value = select;
+  presetGroups.clear();
+  userPresets = new Set(d.user);
+  d.builtin.forEach(n => {
+    const [style, label] = splitPreset(n);
+    if (!presetGroups.has(style)) presetGroups.set(style, []);
+    presetGroups.get(style).push({ name: n, label });
+  });
+  for (const list of presetGroups.values()) {
+    list.sort((a, b) => (a.label === 'Default' ? -1 : b.label === 'Default' ? 1 : a.label.localeCompare(b.label)));
+  }
+  if (d.user.length) presetGroups.set(MY_PRESETS, d.user.map(n => ({ name: n, label: n })));
+  const sty = $('#preset-style'), keep = sty.value;
+  const styles = [...presetGroups.keys()].filter(s => s !== MY_PRESETS)
+    .sort((a, b) => (a.startsWith('Classic') ? -1 : b.startsWith('Classic') ? 1 : a.localeCompare(b)));
+  if (presetGroups.has(MY_PRESETS)) styles.push(MY_PRESETS);
+  sty.innerHTML = styles.map(s => `<option value="${esc(s)}">${esc(s)} (${presetGroups.get(s).length})</option>`).join('');
+  let want = keep && presetGroups.has(keep) ? keep : styles[0];
+  if (select) want = userPresets.has(select) ? MY_PRESETS : splitPreset(select)[0];
+  sty.value = want;
+  fillSetups(select);
+}
+function fillSetups(select) {
+  const sel = $('#preset-list'), list = presetGroups.get($('#preset-style').value) || [];
+  sel.innerHTML = list.map(p => `<option value="${esc(p.name)}">${esc(p.label)}</option>`).join('');
+  if (select && list.some(p => p.name === select)) sel.value = select;
+  $('#preset-del').disabled = !userPresets.has(sel.value);
+}
+async function applyPreset(name) {
+  if (!name) return;
+  /* auto-run paints it for real in a moment: a server preview now would
+     only steal CPU from that Run (a Canvas Oil draft takes seconds) */
+  live.holdPreview = autoRunOn() && state.open;
+  try {
+    const d = await api('/api/preset/' + encodeURIComponent(name));
+    const takes = $('#f-samples') && $('#f-samples').value;      /* Takes belong to the user, not the preset */
+    applyParams(d.params);
+    if (takes) applyParams({ samples: takes });
+    settingsChanged(null);
+    toast('Preset "' + name + '" loaded');
+  } catch (err) { toast(err.message, 'bad'); }
 }
 
-$('#preset-list').onchange = async e => {
+/* Auto-run: picking a preset or an action presses Run for you.
+   If something is running, it is stopped first; the last pick wins. */
+const autoRunOn = () => $('#auto-run').checked;
+(() => {
+  const cb = $('#auto-run');
+  try { const v = localStorage.getItem('oilstudio.autoRun'); if (v !== null) cb.checked = v === '1'; } catch { /* private mode */ }
+  cb.addEventListener('change', () => { try { localStorage.setItem('oilstudio.autoRun', cb.checked ? '1' : '0'); } catch { /* ignore */ } });
+})();
+let autoSeq = 0;
+async function autoFire(buttonSel) {
+  if (!autoRunOn() || !state.open) { live.holdPreview = false; return; }
+  const my = ++autoSeq;
+  state.autoPending = true;               /* keep previews held through stop + run */
   try {
-    const d = await api('/api/preset/' + encodeURIComponent(e.target.value));
-    applyParams(d.params);
-    settingsChanged(null);
-    toast('Preset "' + e.target.value + '" loaded');
-  } catch (err) { toast(err.message, 'bad'); }
+  if (state.running) {
+    $('#btn-stop').click();
+    const t0 = Date.now();
+    while (state.running && Date.now() - t0 < 120000) {
+      await new Promise(r => setTimeout(r, 150));
+      if (my !== autoSeq) return;          /* a newer pick took over */
+    }
+    if (state.running) return;
+  }
+  if (my !== autoSeq) return;
+  const btn = $(buttonSel);
+  live.holdPreview = true;
+  if (btn && !btn.disabled) btn.click();
+  else live.holdPreview = false;           /* nothing ran: previews again */
+  } finally { if (my === autoSeq) state.autoPending = false; }
+}
+window.autoFire = autoFire;
+
+/* a new style loads its first setup (its Default when it has one) */
+$('#preset-style').onchange = async () => {
+  fillSetups();
+  await applyPreset($('#preset-list').value);
+  autoFire('#btn-run');
+};
+$('#preset-list').onchange = async e => {
+  $('#preset-del').disabled = !userPresets.has(e.target.value);
+  await applyPreset(e.target.value);
+  autoFire('#btn-run');
 };
 
 $('#preset-save').onclick = async () => {
-  const name = prompt('Name for this preset:');
+  const cur = $('#preset-list').value;
+  const name = prompt('Name for this preset (same name = update it):', userPresets.has(cur) ? cur : '');
   if (!name) return;
   try {
     const r = await api('/api/preset', {
@@ -1053,7 +1320,7 @@ async function uploadExtra(input, kind) {
       const sel = $('#f-canvas_texture');
       if (sel && [...sel.options].some(o => o.value === 'Custom')) sel.value = 'Custom';
     }
-    live.customChanged && live.supported && live.customChanged(kind);
+    live.customChanged && live.ok && live.customChanged(kind);
     settingsChanged(kind === 'logo' ? 'text_logo' : 'canvas_texture');
     toast(kind === 'logo' ? 'Logo loaded' : 'Canvas sample loaded', 'good');
   } catch (err) { toast(err.message, 'bad'); }

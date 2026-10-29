@@ -241,31 +241,56 @@ def render(image_bgr: np.ndarray, p: dict, progress=None, min_side: int = MIN_SI
 
     rgb = np.ascontiguousarray(image_bgr[..., ::-1]).astype(np.float32) / 255.0
     h, w = rgb.shape[:2]
+    report(0.1, "Halftone: textures")
+    tex = textures(h, w, p)
+    return apply(rgb, tex, p, report)
+
+
+# --------------------------------------------------------------------------
+# the random textures (no photo needed) - also sent to the GPU
+# --------------------------------------------------------------------------
+def tex_key(p):
+    """What the textures depend on (besides the size)."""
+    return (int(p.get("ht_seed", 7)), float(p.get("ht_grid_size", 38)),
+            float(p.get("ht_scratches", 50)), float(p.get("ht_grid", 100)) > 0)
+
+
+def textures(h, w, p):
+    """grain noise, cloth weave and scratch veins for a picture of h x w.
+    One generator per texture, so the preview and the full-size result get
+    the same scratches and the same cloth wobble."""
     s = max(h, w) / REF_SIDE
     seed = int(p.get("ht_seed", 7))
-    # one generator per texture, so the preview and the full-size result
-    # get the same scratches and the same cloth wobble
-    rng_grain = np.random.default_rng(seed)
-    rng_cloth = np.random.default_rng(seed + 1009)
-    rng_veins = np.random.default_rng(seed + 2017)
+    out = {"grain": _smooth_noise((h, w), max(0.6, 1.0 * s), np.random.default_rng(seed))}
+    if float(p.get("ht_grid", 100)) > 0:
+        out["cloth"] = cloth(h, w, s, np.random.default_rng(seed + 1009),
+                             pitch=float(p.get("ht_grid_size", 38)))
+    out["veins"] = veins(h, w, s, np.random.default_rng(seed + 2017),
+                         float(p.get("ht_scratches", 50)))
+    return out
 
-    report(0.1, "Halftone: tone")
+
+ASSET_NAMES = ()
+
+
+def look_payload():
+    return {"film": _FILM.tolist(), "ref_side": REF_SIDE, "min_side": MIN_SIDE, "textures": True}
+
+
+def apply(rgb, tex, p, report=lambda f, t: None):
+    """The photo steps (the GPU runs the same ones, static/js/oilfx.js)."""
+    h, w = rgb.shape[:2]
+    s = max(h, w) / REF_SIDE
+    report(0.3, "Halftone: tone, stipple")
     g = tone(rgb, s, p.get("ht_contrast", 50), p.get("ht_clarity", 50))
-    report(0.3, "Halftone: stipple")
-    x = stipple(g, s, rng_grain, p.get("ht_grain", 50), p.get("ht_edges", 50))
+    x = stipple_n(g, s, tex["grain"], p.get("ht_grain", 50), p.get("ht_edges", 50))
     x = np.repeat(x[..., None], 3, axis=2)
-
     grid = float(p.get("ht_grid", 100)) / 100.0
-    if grid > 0:
-        report(0.5, "Halftone: cloth")
-        tex = cloth(h, w, s, rng_cloth, pitch=float(p.get("ht_grid_size", 38)))
-        tex = 1 - (1 - tex) * grid
-        x = np.clip(x + tex[..., None] - 1, 0, 1)               # Linear Burn
-    sc = float(p.get("ht_scratches", 50))
-    report(0.7, "Halftone: scratches")
-    v = veins(h, w, s, rng_veins, sc)
+    if grid > 0 and "cloth" in tex:
+        t = 1 - (1 - tex["cloth"]) * grid
+        x = np.clip(x + t[..., None] - 1, 0, 1)                 # Linear Burn
+    v = tex["veins"]
     x = np.where(v >= 1, 1, np.minimum(1, x / np.maximum(1 - v, 1e-4)))   # Color Dodge
-
     report(0.9, "Halftone: colour")
     lum = x[..., 0] * 0.3 + x[..., 1] * 0.59 + x[..., 2] * 0.11
     lut = ramp(p.get("ht_dark", DEFAULT_DARK), p.get("ht_light", DEFAULT_LIGHT),
@@ -273,3 +298,18 @@ def render(image_bgr: np.ndarray, p: dict, progress=None, min_side: int = MIN_SI
     idx = np.clip((lum * 255 + 0.5).astype(np.int32), 0, 255)
     out = lut[idx]
     return (out[..., ::-1] * 255.0).astype(np.float32)
+
+
+def stipple_n(g, s, n, grain=50, edges=50, levels=9):
+    """stipple() with the grain noise given (see textures())."""
+    step = 1.0 / (levels - 1)
+    q = np.minimum(np.round(g / step) * step, 1.0)
+    det = (_gauss(g, 2.5 * s) - _gauss(g, 0.7 * s)) / 0.03
+    amp = (1.35 - 2.0 * np.maximum(g - 0.5, 0)) * (grain / 50.0)
+    speck = (n * amp + det) > 1.0
+    out = np.where(speck, np.maximum(q - 2 * step, 0), q)
+    if edges > 0:
+        thr = 0.065 * (50.0 / max(edges, 1)) ** 0.6
+        edge = (_gauss(g, 2.0 * s) - _gauss(g, 0.6 * s) + n * 0.012) > thr
+        out = np.where(edge, 0.0, out)
+    return out.astype(np.float32)

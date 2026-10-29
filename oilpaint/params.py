@@ -176,24 +176,100 @@ OIL_SMEAR = {
     "sm_seed": (1, 0, 9999),
 }
 
+# Oil Paint FX: Photoshop oil-paint filters, crack texture and a grunge edge
+# over a yellow ground - see oilfx.py (100 = the template on every slider)
+OIL_FX = {
+    "fx_smooth": (100, 0, 200),         # Surface Blur: flat, smooth paint areas
+    "fx_brush": (100, 0, 300),          # Oil Paint: smoothing along the strokes
+    "fx_detail": (100, 0, 200),         # High Pass + Smart Sharpen: crisp edges
+    "fx_color": (100, 0, 200),          # vibrance and the template's colour curve
+    "fx_texture": (100, 0, 200),        # cracked paint texture (Overlay)
+    "fx_tone": (100, 0, 300),           # soft colour cloud over the picture
+    "fx_edges": (100, 0, 100),          # grunge edge: yellow ground shows through
+    "fx_adjust": (100, 0, 100),         # Vibrance, Curves, Color Balance layers
+    "fx_seed": (0, 0, 9999),            # 0 = the template; others nudge the settings
+}
+
+# Sketch Paint: blotchy poster paint, pencil-sketch overlay and ink outlines
+# - see sketchfx.py (100 = the template on every slider)
+SKETCH_PAINT = {
+    "sk_smooth": (100, 0, 200),         # Surface Blur
+    "sk_brush": (100, 0, 300),          # Oil Paint smoothing along the shapes
+    "sk_detail": (100, 0, 200),         # Unsharp Mask
+    "sk_blotch": (100, 0, 300),         # Dry Brush blotches (size)
+    "sk_poster": (100, 0, 200),         # Poster Edges: tone steps
+    "sk_edges": (100, 0, 200),          # Poster Edges: dark edges
+    "sk_outline": (100, 0, 140),        # Photocopy ink outline
+    "sk_sketch": (100, 0, 140),         # pencil-sketch pattern
+    "sk_contrast": (100, 0, 100),       # the template's Levels
+    "sk_seed": (0, 0, 9999),
+}
+
+# Rough Brush: oil paint smeared into rough brush strokes over a dark
+# ground - see brushfx.py (100 = the template on every slider)
+ROUGH_BRUSH = {
+    "rb_paint": (100, 0, 200),          # Oil Paint: smear along the shapes
+    "rb_smooth": (100, 0, 300),         # Oil Paint: cleanliness (smoother paint)
+    "rb_poster": (100, 0, 300),         # Posterize: higher = fewer, bolder tones
+    "rb_cutout": (100, 0, 100),         # Cutout: flat patches of colour
+    "rb_warp": (100, 0, 200),           # Displace: how far the brush strokes drag
+    "rb_blur": (100, 0, 300),           # soft paint edges
+    "rb_texture": (100, 0, 160),        # brush-stroke texture (Overlay)
+    "rb_adjust": (100, 0, 100),         # Vibrance + Curves
+    "rb_seed": (0, 0, 9999),
+}
+
+# Watercolor: washes, blotches and crosshatch inside a ragged brush-edge
+# frame on cream paper - see watercolor.py (100 = the template)
+WATERCOLOR = {
+    "wc_frame": (100, 0, 100),          # ragged paper edge (0 = the picture fills the page)
+    "wc_wash": (100, 0, 200),           # size of the soft colour washes
+    "wc_blotch": (100, 0, 250),         # Dry Brush / Palette Knife blotches
+    "wc_detail": (100, 0, 250),         # Unsharp Mask on the paint
+    "wc_color": (100, 0, 200),          # how strong the washes' colours are
+    "wc_paper": (100, 0, 200),          # paper textures
+    "wc_adjust": (100, 0, 100),         # Levels, Curves, colour grade
+    "wc_seed": (0, 0, 9999),
+}
+
 # the template styles (Canvas Oil, Halftone, Painted Photo, Impression,
 # Oil Smear) make several variations per Run, each with its own random seed
 SAMPLES = {
     "samples": (8, 1, 16),
 }
+# Silk Oil: soft oil smears with fine bristle streaks, an impasto texture and
+# diagonal light - see silkoil.py (100 = the template on every slider)
+SILK_OIL = {
+    "sl_smooth": (100, 0, 250),         # blotchy underpainting (Kuwahara)
+    "sl_smear": (100, 0, 250),          # Oil Paint: how far the paint is smeared along the shapes
+    "sl_streaks": (100, 0, 300),        # fine bristle streaks in the smears
+    "sl_texture": (100, 0, 300),        # the impasto texture (glass + relief)
+    "sl_light": (100, 0, 250),          # diagonal Graphic Pen light (Soft Light)
+    "sl_color": (100, 0, 100),          # the template's colour and tone
+    "sl_seed": (0, 0, 9999),
+}
+
 # which seed each of those styles changes for its variations
-SEED_KEYS = {"Canvas Oil": "co_seed", "Halftone": "ht_seed", "Painted Photo": "pp_seed",
+SEED_KEYS = {"Brush Strokes": "random_seed",
+             "Oil Paint FX": "fx_seed", "Sketch Paint": "sk_seed", "Rough Brush": "rb_seed",
+             "Watercolor": "wc_seed", "Silk Oil": "sl_seed",
+             "Canvas Oil": "co_seed", "Halftone": "ht_seed", "Painted Photo": "pp_seed",
              "Impression": "im_seed", "Oil Smear": "sm_seed"}
 
 NUMERIC = {}
 for _group in (PAINTING, EDGE, ABSTRACT, LIGHT, CANVAS, FRAME, TEXT, CANVAS_OIL, HALFTONE,
-               PAINTED, IMPRESSION, OIL_SMEAR, SAMPLES):
+               PAINTED, IMPRESSION, OIL_SMEAR, OIL_FX, SKETCH_PAINT, ROUGH_BRUSH, WATERCOLOR, SILK_OIL, SAMPLES):
     NUMERIC.update(_group)
 
 # Non numeric options ------------------------------------------------------
-PAINT_STYLES = ["Brush Strokes", "Canvas Oil", "Halftone", "Painted Photo", "Impression", "Oil Smear"]
+PAINT_STYLES = ["Brush Strokes", "Canvas Oil", "Halftone", "Painted Photo", "Impression", "Oil Smear",
+                "Oil Paint FX", "Sketch Paint", "Rough Brush", "Watercolor", "Silk Oil"]
 # styles made on the CPU in one go (no strokes for the GPU to restyle)
-CPU_STYLES = ("Canvas Oil", "Halftone", "Painted Photo", "Impression", "Oil Smear")
+CPU_STYLES = ("Canvas Oil", "Halftone", "Painted Photo", "Impression", "Oil Smear", "Oil Paint FX",
+              "Sketch Paint", "Rough Brush", "Watercolor", "Silk Oil")
+# styles the GPU can make as image filters (static/js/oilfx.js), not strokes
+GPU_FILTER_STYLES = ("Oil Paint FX", "Sketch Paint", "Rough Brush", "Watercolor", "Silk Oil", "Halftone",
+                     "Impression", "Painted Photo", "Oil Smear", "Canvas Oil")
 
 CHOICES = {
     "paint_style": (PAINT_STYLES, "Brush Strokes"),

@@ -8,6 +8,9 @@ import sys
 import json
 
 datas = [("templates", "templates"), ("static", "static")]
+for _r in ("oil_fx", "sketch_paint", "rough_brush", "watercolor", "silk_oil"):              # template pictures of the filter styles
+    if os.path.isdir("recipes/" + _r):
+        datas.append(("recipes/" + _r, "recipes/" + _r))
 
 # Ship the action library README, plus only the packs whose files are inside
 # their own folder. A pack.json with "folder": "C:\\Users\\..." points at files

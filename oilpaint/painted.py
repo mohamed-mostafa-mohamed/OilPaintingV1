@@ -66,64 +66,98 @@ def _noise(shape, sigma, rng):
 # --------------------------------------------------------------------------
 # 1-3. the painted patches
 # --------------------------------------------------------------------------
-def cutout(rgb, s, rng, levels=8, detail=50, seed=3):
-    """Flat patches: brightness levels split by colour family, each patch
-    filled with its average colour. Big pictures are cut out at half size
-    (the patches are large) and enlarged."""
-    h, w = rgb.shape[:2]
-    if s > 0.6:
-        small = cv2.resize(rgb, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
-        out = cutout(small, s / 2, rng, levels, detail, seed)
-        return cv2.resize(out, (w, h), interpolation=cv2.INTER_NEAREST)
+CUT_SIGMA = 32.0       # how far a patch gathers its colour (reference px)
+FAMILIES = 6
+
+
+WIDE_STEP = 4.0
+
+
+def wide_blur(x, sigma):
+    """A wide Gaussian blur made on a copy shrunk by a whole factor (fast);
+    the GPU does exactly this too (static/js/oilfx.js, wideBlur)."""
+    f = int(sigma // WIDE_STEP)
+    if f < 2:
+        return _gauss(x, sigma)
+    h, w = x.shape[:2]
+    sw, sh = max(1, w // f), max(1, h // f)
+    small = cv2.resize(x, (sw, sh), interpolation=cv2.INTER_AREA)
+    small = _gauss(small, sigma / f)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def cutout_res(h, w, s):
+    """Big pictures are cut out at half size (or less): the patches are large."""
+    while s > 0.6:
+        h, w, s = h // 2, w // 2, s / 2
+    return h, w, s
+
+
+def cutout_base(small, s, detail=50):
     r = max(2.0, (10.0 - 6.0 * detail / 100.0) * s)
-    base = rgb
+    base = small
     for _ in range(2):
         base = F.guided(base, r, 0.003)
+    return base
+
+
+def cutout_stats(base, levels=8, seed=3):
+    """The two numbers the GPU cannot find itself: the brightness range and
+    the colour families (k-means). The server sends them to the GPU."""
     L = F.lum(base)
     lo, hi = np.percentile(L, 1), np.percentile(L, 99)
-    n = int(levels)
-    lv = np.clip(((L - lo) / (hi - lo + 1e-6) * n).astype(np.int32), 0, n - 1).astype(np.uint8)
-    ks = int((9 - 4 * detail / 100.0) * s) | 1
-    lv = cv2.medianBlur(lv, max(3, min(ks, 255)))
-
-    # colour families, so a blue eye is not merged into the skin around it
     lab = cv2.cvtColor(base.astype(np.float32), cv2.COLOR_RGB2Lab)
     ab = lab[..., 1:]
     sw = 160
     smp = cv2.resize(ab, (sw, max(8, int(sw * ab.shape[0] / ab.shape[1]))),
                      interpolation=cv2.INTER_AREA).reshape(-1, 2).astype(np.float32)
-    k = 6
     cv2.setRNGSeed(seed)
-    _, _, cen = cv2.kmeans(smp, k, None,
+    _, _, cen = cv2.kmeans(smp, FAMILIES, None,
                            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-2),
                            2, cv2.KMEANS_PP_CENTERS)
+    return {"lo": float(lo), "hi": float(hi), "cen": cen.astype(np.float32).tolist()}
+
+
+def _small(rgb, h, w):
+    return rgb if rgb.shape[:2] == (h, w) else cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
+
+
+def cutout(rgb, s, rng=None, levels=8, detail=50, seed=3, stats=None):
+    """Flat patches: brightness levels split by colour family; every pixel
+    takes the mean colour of the nearby pixels of its own level and family
+    (a wide, level-limited blur - the GPU can do the same, see oilfx.js)."""
+    h0, w0 = rgb.shape[:2]
+    h, w, cs = cutout_res(h0, w0, s)
+    small = _small(rgb, h, w)
+    base = cutout_base(small, cs, detail)
+    st = stats or cutout_stats(base, levels, seed)
+    L = F.lum(base)
+    n = int(levels)
+    lv = np.clip(((L - st["lo"]) / (st["hi"] - st["lo"] + 1e-6) * n).astype(np.int32), 0, n - 1).astype(np.uint8)
+    ks = int((9 - 4 * detail / 100.0) * cs) | 1
+    lv = cv2.medianBlur(lv, max(3, min(ks, 255)))
+    # colour families, so a blue eye is not merged into the skin around it
+    ab = cv2.cvtColor(base.astype(np.float32), cv2.COLOR_RGB2Lab)[..., 1:]
+    cen = np.asarray(st["cen"], np.float32)
     d = np.stack([((ab - c) ** 2).sum(-1) for c in cen], 0)
     nearest = d.argmin(0)
-    prob = np.stack([_gauss((nearest == i).astype(np.float32), 2.5 * s) for i in range(k)], 0)
+    prob = np.stack([_gauss((nearest == i).astype(np.float32), 2.5 * cs) for i in range(len(cen))], 0)
     fam = prob.argmax(0).astype(np.int32)
-    key = lv.astype(np.int32) * k + fam
-
-    labels = np.zeros(key.shape, np.int32)
-    nxt = 0
+    key = lv.astype(np.int32) * len(cen) + fam
+    out = np.zeros_like(base)
     for v in np.unique(key):
-        m = (key == v).astype(np.uint8)
-        c, lab_ = cv2.connectedComponents(m, connectivity=4)
-        sel = lab_ > 0
-        labels[sel] = lab_[sel] + nxt
-        nxt += c
-    cnt = np.bincount(labels.ravel(), minlength=nxt + 1).astype(np.float32)
-    out = np.empty_like(rgb)
-    for ch in range(3):
-        mean = np.bincount(labels.ravel(), weights=base[..., ch].ravel(),
-                           minlength=nxt + 1) / np.maximum(cnt, 1)
-        out[..., ch] = mean[labels]
+        m = (key == v).astype(np.float32)
+        acc = wide_blur(np.dstack([base * m[..., None], m]), CUT_SIGMA * cs)
+        out += acc[..., :3] / np.maximum(acc[..., 3:], 1e-6) * m[..., None]
+    if (h, w) != (h0, w0):
+        out = cv2.resize(out, (w0, h0), interpolation=cv2.INTER_NEAREST)
     return out
 
 
-def brushwork(patches, rgb, s, rng, outline=50, texture=50):
+def brushwork(patches, rgb, s, rng, outline=50, texture=50, tex=None):
     # ragged patch edges (dry brush / palette knife)
-    dx = _noise(patches.shape[:2], 1.5 * s, rng)
-    dy = _noise(patches.shape[:2], 1.5 * s, rng)
+    dx = tex["dx"] if tex else _noise(patches.shape[:2], 1.5 * s, rng)
+    dy = tex["dy"] if tex else _noise(patches.shape[:2], 1.5 * s, rng)
     out = F.remap(patches, dx * 1.6 * s, dy * 1.6 * s)
     out = np.power(np.clip(out, 0, 1), 1.1)       # the paint filters darken a little
     # push neighbouring patches apart a little, like Poster Edges does
@@ -153,10 +187,21 @@ def brushwork(patches, rgb, s, rng, outline=50, texture=50):
     # palette-knife speckle and a light canvas relief
     t = texture / 50.0
     if t > 0:
-        cells = np.tanh(2.5 * _noise(patches.shape[:2], 1.0 * s, rng))     # crisp little cells
+        cells = np.tanh(2.5 * (tex["cells"] if tex else _noise(patches.shape[:2], 1.0 * s, rng)))
         out = out * (1 + cells[..., None] * 0.02 * t)
-        out = F.fg_texturizer(np.clip(out, 0, 1), s, "TxCa", 200, 2 * t, "LgTp")
+        shade = tex["shade"] if tex else canvas_shade(*patches.shape[:2], s)
+        out = np.clip(np.clip(out, 0, 1) * (1 + shade[..., None] * (2 * t) / 50.0 * 2), 0, 1)
     return np.clip(out, 0, 1)
+
+
+def canvas_shade(h, w, s):
+    """The Texturizer's canvas relief (light from the top), -1..1 - the same
+    numbers F.fg_texturizer uses, without the picture."""
+    t = F.texture_map("TxCa", h, w, max(0.3, 200 / 100.0 * s))
+    gy = cv2.Sobel(t, cv2.CV_32F, 0, 1, ksize=3)
+    gx = cv2.Sobel(t, cv2.CV_32F, 1, 0, ksize=3)
+    shade = -(gx * 0.7 + gy * 0.7)
+    return (shade / (np.abs(shade).max() + 1e-6)).astype(np.float32)
 
 
 # --------------------------------------------------------------------------
@@ -283,6 +328,45 @@ def grade(x, amount=100):
 # --------------------------------------------------------------------------
 # the whole look
 # --------------------------------------------------------------------------
+ASSET_NAMES = ()
+
+
+def tex_key(p):
+    return (int(p.get("pp_seed", 3)), float(p.get("pp_grain", 50)),
+            float(p.get("pp_paper", 100)) > 0, float(p.get("pp_texture", 50)) > 0)
+
+
+def textures(h, w, p):
+    """The random fields of the look (same generators and order as before)."""
+    s = max(h, w) / REF_SIDE
+    seed = int(p.get("pp_seed", 3))
+    rng_brush = np.random.default_rng(seed)
+    t = {"dx": _noise((h, w), 1.5 * s, rng_brush), "dy": _noise((h, w), 1.5 * s, rng_brush)}
+    if float(p.get("pp_texture", 50)) > 0:
+        t["cells"] = _noise((h, w), 1.0 * s, rng_brush)
+        t["shade"] = canvas_shade(h, w, s)
+    if float(p.get("pp_paper", 100)) > 0:
+        rng_paper = np.random.default_rng(seed + 4099)
+        ga = float(p.get("pp_grain", 50)) / 50.0
+        t["kraft"] = kraft(h, w, s, rng_paper, ga)
+        t["oldpaper"] = old_paper(h, w, s, rng_paper, ga)
+    return t
+
+
+def analyse(rgb, p):
+    """Numbers from the photo the GPU needs (see cutout_stats)."""
+    h0, w0 = rgb.shape[:2]
+    s = max(h0, w0) / REF_SIDE
+    h, w, cs = cutout_res(h0, w0, s)
+    base = cutout_base(_small(rgb, h, w), cs, p.get("pp_detail", 50))
+    return cutout_stats(base, p.get("pp_levels", 8), int(p.get("pp_seed", 3)))
+
+
+def look_payload():
+    return {"ref_side": REF_SIDE, "min_side": MIN_SIDE, "textures": True, "analyse": True,
+            "grade": _GRADE.tolist(), "cut_sigma": CUT_SIGMA, "wide_step": WIDE_STEP}
+
+
 def render(image_bgr: np.ndarray, p: dict, progress=None, min_side: int = MIN_SIDE) -> np.ndarray:
     """image_bgr float32/uint8 BGR 0..255 -> float32 BGR 0..255."""
     h0, w0 = image_bgr.shape[:2]
@@ -299,24 +383,25 @@ def render(image_bgr: np.ndarray, p: dict, progress=None, min_side: int = MIN_SI
 
     rgb = np.ascontiguousarray(np.asarray(image_bgr, np.float32)[..., ::-1]) / 255.0
     h, w = rgb.shape[:2]
+    report(0.05, "Painted Photo: textures")
+    return apply(rgb, textures(h, w, p), analyse(rgb, p), p, report)
+
+
+def apply(rgb, tex, ana, p, report=lambda f, x: None):
+    """The photo steps (the GPU runs the same ones, static/js/oilfx.js)."""
+    h, w = rgb.shape[:2]
     s = max(h, w) / REF_SIDE
     seed = int(p.get("pp_seed", 3))
-    rng_brush = np.random.default_rng(seed)
-    rng_paper = np.random.default_rng(seed + 4099)
-
     report(0.1, "Painted Photo: cutting out the patches")
-    patches = cutout(rgb, s, rng_brush, p.get("pp_levels", 8), p.get("pp_detail", 50), seed)
+    patches = cutout(rgb, s, None, p.get("pp_levels", 8), p.get("pp_detail", 50), seed, stats=ana)
     report(0.5, "Painted Photo: brushwork")
-    x = brushwork(patches, rgb, s, rng_brush, p.get("pp_outline", 50), p.get("pp_texture", 50))
+    x = brushwork(patches, rgb, s, None, p.get("pp_outline", 50), p.get("pp_texture", 50), tex=tex)
 
     paper = float(p.get("pp_paper", 100)) / 100.0
-    if paper > 0:
+    if paper > 0 and "kraft" in tex:
         report(0.7, "Painted Photo: paper")
-        ga = float(p.get("pp_grain", 50)) / 50.0
-        kr = kraft(h, w, s, rng_paper, ga)
-        x = x + (_soft_light(x, kr) - x) * paper                       # Soft Light 100%
-        op = old_paper(h, w, s, rng_paper, ga)
-        x = x + (x * op - x) * 0.5 * paper                            # Multiply 50%
+        x = x + (_soft_light(x, tex["kraft"]) - x) * paper            # Soft Light 100%
+        x = x + (x * tex["oldpaper"] - x) * 0.5 * paper               # Multiply 50%
     report(0.9, "Painted Photo: film grade")
     x = np.clip(x, 0, 1)
     # grade the smooth picture, then put the grain back as light/dark only:

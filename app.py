@@ -11,6 +11,7 @@ post-processing brushes and batch processing.
 from __future__ import annotations
 
 import io
+import json
 import math
 import os
 import subprocess
@@ -29,6 +30,8 @@ from oilpaint import brushes as B
 from oilpaint import decoration as D
 from oilpaint import engine, params
 from oilpaint import planner as PL
+from oilpaint import fxstyles
+from oilpaint import abstract as AB
 from oilpaint.presets import PresetStore
 from actions import BRUSH_MODES, ActionEngine, ActionError, Stopped
 
@@ -64,7 +67,8 @@ QUALITY = {"draft": 650, "normal": 1000, "high": 1500, "max": 2400}
 MAX_QUALITY_MIN_SIDE = 2400
 # styles whose look lives in pixel-sized detail (grain, dot grid) are always
 # made at the photo's full size, like Photoshop; Quality only affects drafts
-FULL_SIZE_STYLES = ("Halftone", "Painted Photo", "Impression", "Oil Smear")
+FULL_SIZE_STYLES = ("Halftone", "Painted Photo", "Impression", "Oil Smear", "Oil Paint FX", "Sketch Paint",
+                    "Rough Brush", "Watercolor", "Silk Oil")
 
 
 def _work_side(p, quality, src_side=MAX_SOURCE_SIDE):
@@ -407,8 +411,8 @@ def api_open():
         d.painting = d.edited = d.height = None
         d.set_layers(None, None, ())
         d.token = uuid.uuid4().hex
-        d.live_cache.reset()
-        d.proxy_cache.reset()
+        d.live_cache = PL.AnalysisCache()   # new object: a preview still using the old one is safe
+        d.proxy_cache = PL.AnalysisCache()
         d.shots.clear()
         d.selected = -1
         d.undo.clear()
@@ -437,8 +441,8 @@ def api_run():
 
         work = work_image(d.source, p, quality)
         if d.original is None or d.original.shape != work.shape:
-            d.live_cache.reset()
-            d.proxy_cache.reset()
+            d.live_cache = PL.AnalysisCache()   # new object: a preview still using the old one is safe
+            d.proxy_cache = PL.AnalysisCache()
         d.original = work
         pinned = [s for s in d.shots if s.get("pinned")]
         d.shots = pinned
@@ -457,15 +461,23 @@ def api_run():
             def on_shot(idx, image):
                 thumb = fit(np.clip(image, 0, 255).astype(np.uint8), 240)
                 with d.lock:
+                    if d.job is not job or job.get("detached"):   # an old, stopped Run
+                        return
                     d.shots.append({"image": np.clip(image, 0, 255).astype(np.uint8),
                                     "thumb": thumb, "pinned": False,
                                     "manual": False, "id": uuid.uuid4().hex})
 
-            result, _, meta = engine.paint(
-                work, p, progress=progress, snapshots=shots,
-                on_snapshot=on_shot, should_stop=lambda: job["stop"])
+            try:
+                result, _, meta = engine.paint(
+                    work, p, progress=progress, snapshots=shots,
+                    on_snapshot=on_shot, should_stop=lambda: job["stop"])
+            except engine.PaintStopped:
+                job["error"] = "Stopped — the photo was not changed."
+                return
 
             with d.lock:
+                if d.job is not job or job.get("detached"):
+                    return
                 d.painting = result.astype(np.float32)
                 d.edited = d.painting.copy()
                 d.height = np.zeros(result.shape[:2], np.float32)
@@ -481,16 +493,61 @@ def api_run():
             if meta.get("style") in params.CPU_STYLES:
                 job["engine"] = {"Canvas Oil": "canvas_oil", "Halftone": "halftone",
                                  "Painted Photo": "painted", "Impression": "impression",
-                                 "Oil Smear": "smear"
+                                 "Oil Smear": "smear", "Oil Paint FX": "oilfx",
+                                 "Sketch Paint": "sketchfx", "Rough Brush": "brushfx",
+                                 "Watercolor": "watercolor", "Silk Oil": "silkoil"
                                  }.get(meta["style"], "canvas_oil")
         except Exception as exc:                      # noqa: BLE001
             job["error"] = f"{type(exc).__name__}: {exc}"
         finally:
-            job["running"] = False
-            job["progress"] = 1.0
+            if not job.get("detached"):
+                job["running"] = False
+                job["progress"] = 1.0
 
     threading.Thread(target=worker, daemon=True).start()
     return jsonify(ok=True)
+
+
+@app.post("/api/take/clear")
+def api_take_clear():
+    """A GPU Run starts: the last Run's unpinned shots go (like a CPU Run)."""
+    d = doc()
+    with d.lock:
+        d.shots = [s for s in d.shots if s.get("pinned")]
+        d.selected = -1
+    return ("", 204)
+
+
+@app.post("/api/take")
+def api_take():
+    """One finished take of a GPU Run, straight into the Timeline (so the
+    variations show up one by one, not all at the end). ``run`` names the
+    Run; ``finish`` is "brush" (Brush Strokes) or "filter"."""
+    d = doc()
+    f = request.files.get("image")
+    run = str(request.form.get("run", ""))[:64]
+    if f is None or not run:
+        return jsonify(error="Missing the picture."), 400
+    img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR)
+    with d.lock:
+        brush = request.form.get("finish") == "brush"
+        pend = getattr(d, "gpu_pending" if brush else "fx_pending", None)
+        src = d.original
+    if img is None or src is None:
+        return jsonify(error="Not a picture."), 400
+    h, w = src.shape[:2]
+    if img.shape[:2] != (h, w):                     # made bigger for the grain: back to size
+        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+    p = (pend or {}).get("params") or d.params
+    steps = ("lightening", "blend") if brush else ("blend",)
+    shot = np.clip(engine.finish(img.astype(np.float32), None, p, src.astype(np.float32), steps),
+                   0, 255).astype(np.uint8)
+    with d.lock:
+        # a new Run: the unpinned shots of the last one go
+        d.shots = [s for s in d.shots if s.get("pinned") or s.get("run") == run]
+        d.shots.append({"image": shot, "thumb": fit(shot, 240), "pinned": False,
+                        "manual": False, "id": uuid.uuid4().hex, "run": run})
+    return ("", 204)
 
 
 # --------------------------------------------------------------------------
@@ -518,8 +575,8 @@ def api_gpu_plan():
             return jsonify(error="A painting is already in progress."), 409
         work = work_image(d.source, p, quality)
         if d.original is None or d.original.shape != work.shape:
-            d.live_cache.reset()
-            d.proxy_cache.reset()
+            d.live_cache = PL.AnalysisCache()   # new object: a preview still using the old one is safe
+            d.proxy_cache = PL.AnalysisCache()
         d.original = work
         token = d.token
     t0 = time.time()
@@ -530,6 +587,232 @@ def api_gpu_plan():
                          "order": _clean_order(body.get("deco_order")), "t0": t0}
     return _binary(PL.encode(plan, scale=1.0, ground_side=1200),
                    {"X-Plan-Seconds": f"{time.time() - t0:.3f}"})
+
+
+# --------------------------------------------------------------------------
+# routes: problems with the graphics card, written down
+# --------------------------------------------------------------------------
+@app.post("/api/log")
+def api_log():
+    """Graphics card problems from the page -> workdir/gpu_log.txt."""
+    body = request.get_json(silent=True) or {}
+    path = os.path.join(WORK_DIR, "gpu_log.txt")
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+            os.replace(path, path + ".old")
+        line = json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                           **{k: str(body.get(k, ""))[:2500] for k in ("where", "msg", "stack", "gpu", "ua", "extra")}})
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    return ("", 204)
+
+
+# --------------------------------------------------------------------------
+# routes: Oil Paint FX on the GPU (static/js/oilfx.js runs the filters)
+# --------------------------------------------------------------------------
+def _fx_module():
+    mod = fxstyles.module(request.args.get("style", "Oil Paint FX"))
+    if mod is None:
+        abort(404)
+    return mod
+
+
+@app.get("/api/fx/look")
+def api_fx_look():
+    """The numbers a filter style needs on the GPU (fitted tone curve...),
+    the same ones the CPU uses.  ?style=Oil Paint FX | Sketch Paint"""
+    return jsonify(_fx_module().look_payload())
+
+
+@app.get("/api/fx/asset/<name>")
+def api_fx_asset(name):
+    """A template picture cover-cropped to w x h (PNG; alpha kept)."""
+    mod = _fx_module()
+    try:
+        w = int(np.clip(int(request.args.get("w", 0)), 8, 12000))
+        h = int(np.clip(int(request.args.get("h", 0)), 8, 12000))
+    except (TypeError, ValueError):
+        abort(400)
+    if name not in mod.ASSET_NAMES:
+        abort(404)
+    return _png(mod.asset_image(name, h, w))
+
+
+@app.post("/api/fx/prepare")
+def api_fx_prepare():
+    """Step 1 of a GPU Run of a filter style: size the photo for the Quality,
+    apply Abstract Art like the CPU does, and send it (PNG)."""
+    d = doc()
+    if d.source is None:
+        return jsonify(error="Open an image first."), 400
+    body = request.get_json(silent=True) or {}
+    p = params.clean(body.get("params"))
+    if p.get("paint_style") not in params.GPU_FILTER_STYLES:
+        return jsonify(error=f"{p.get('paint_style')} has no GPU filter version."), 400
+    quality = body.get("quality") if body.get("quality") in QUALITY else "normal"
+    with d.lock:
+        if d.job and d.job["running"]:
+            return jsonify(error="A painting is already in progress."), 409
+        work = work_image(d.source, p, quality)
+        if d.original is None or d.original.shape != work.shape:
+            d.live_cache = PL.AnalysisCache()
+            d.proxy_cache = PL.AnalysisCache()
+        d.original = work
+        d.fx_pending = {"params": p, "shape": work.shape, "t0": time.time(),
+                        "order": _clean_order(body.get("deco_order"))}
+    src = work.astype(np.float32)
+    if p["abstract_enabled"]:
+        if p["dist_strength"] > 0:
+            src = AB.distort(src, p)
+        src = AB.correct(src, p)
+    # styles whose grain lives in pixels are made at least MIN_SIDE big and
+    # shrunk afterwards (like their CPU render does)
+    fmod = fxstyles.module(p.get("paint_style"))
+    ms = int(getattr(fmod, "MIN_SIDE", 0) or 0)
+    side = min if getattr(fmod, "MIN_BY", "long") == "short" else max
+    h0, w0 = src.shape[:2]
+    if ms and side(h0, w0) < ms:
+        k = ms / side(h0, w0)
+        src = cv2.resize(src, (int(round(w0 * k)), int(round(h0 * k))), interpolation=cv2.INTER_CUBIC)
+    out8 = np.clip(src, 0, 255).astype(np.uint8)
+    with d.lock:
+        if getattr(d, "fx_pending", None) is not None:
+            d.fx_pending["gpu_shape"] = src.shape
+            d.fx_pending["src_u8"] = out8                  # for /api/fx/analyse
+    return _png(out8)
+
+
+@app.post("/api/fx/analyse")
+def api_fx_analyse():
+    """Numbers a style needs from the photo that the GPU cannot work out
+    itself (e.g. Painted Photo's colour families), from the same picture the
+    GPU paints: the prepared Run picture, or the live preview picture."""
+    d = doc()
+    body = request.get_json(silent=True) or {}
+    mod = fxstyles.module(body.get("style"))
+    if mod is None or not hasattr(mod, "analyse"):
+        return jsonify({})
+    p = params.clean(body.get("params"))
+    with d.lock:
+        if body.get("source") == "run" and getattr(d, "fx_pending", None) and "src_u8" in d.fx_pending:
+            img = d.fx_pending["src_u8"]
+        elif d.original is not None:
+            img = _to_live(d.original, d)
+        elif d.source is not None:                       # nothing painted yet: the photo itself
+            img = d.source
+        else:
+            abort(409, "No image is open.")
+    try:
+        w = int(body.get("w") or img.shape[1]); h = int(body.get("h") or img.shape[0])
+    except (TypeError, ValueError):
+        w, h = img.shape[1], img.shape[0]
+    if (h, w) != img.shape[:2]:
+        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_CUBIC)
+    rgb = np.ascontiguousarray(img[..., ::-1]).astype(np.float32) / 255.0
+    return jsonify(mod.analyse(rgb, p))
+
+
+# the random textures of the GPU filter styles (made here with the same code
+# and seeds as on the CPU, so a GPU Run looks like a CPU Run)
+_TEX_CACHE: "dict" = {}
+_TEX_ORDER: "list" = []
+_TEX_LOCK = threading.Lock()
+
+
+@app.post("/api/fx/textures")
+def api_fx_textures():
+    body = request.get_json(silent=True) or {}
+    mod = fxstyles.module(body.get("style"))
+    if mod is None or not hasattr(mod, "textures"):
+        return jsonify(items=[], token="")
+    p = params.clean(body.get("params"))
+    try:
+        w = int(np.clip(int(body.get("w", 0)), 8, 12000))
+        h = int(np.clip(int(body.get("h", 0)), 8, 12000))
+    except (TypeError, ValueError):
+        abort(400)
+    key = (body.get("style"), h, w, mod.tex_key(p))
+    token = uuid.uuid5(uuid.NAMESPACE_OID, repr(key)).hex
+    with _TEX_LOCK:
+        hit = _TEX_CACHE.get(token)
+    if hit is None:
+        hit = {k: np.ascontiguousarray(v, np.float32) for k, v in mod.textures(h, w, p).items()}
+        with _TEX_LOCK:
+            _TEX_CACHE[token] = hit
+            _TEX_ORDER.append(token)
+            while len(_TEX_ORDER) > 6:                    # keep the last few sizes / seeds
+                _TEX_CACHE.pop(_TEX_ORDER.pop(0), None)
+    items = [{"name": k, "ch": 1 if v.ndim == 2 else v.shape[2], "w": v.shape[1], "h": v.shape[0]}
+             for k, v in hit.items()]
+    return jsonify(token=token, items=items, w=w, h=h)
+
+
+@app.get("/api/fx/texture/<token>/<name>")
+def api_fx_texture(token, name):
+    with _TEX_LOCK:
+        hit = _TEX_CACHE.get(token)
+    if hit is None or name not in hit:
+        abort(404)
+    return _binary(np.ascontiguousarray(hit[name], "<f2").tobytes())
+
+
+@app.post("/api/fx/result")
+def api_fx_result():
+    """Step 2: the picture the GPU made (PNG). Blend with Original, the
+    Timeline and Undo work on it like on a CPU Run."""
+    d = doc()
+    with d.lock:
+        pend = getattr(d, "fx_pending", None)
+    if not pend:
+        return jsonify(error="Prepare the picture first."), 409
+    h, w = pend["shape"][:2]
+    f = request.files.get("canvas")
+    if f is None:
+        return jsonify(error="Missing the picture."), 400
+    gsh = tuple(pend.get("gpu_shape", (h, w))[:2])
+
+    def back(img):
+        """made bigger for the grain (MIN_SIDE): shrink to the photo's size"""
+        if img is not None and img.shape[:2] == gsh and gsh != (h, w):
+            return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+        return img
+    bare = back(cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR))
+    if bare is None or bare.shape[:2] != (h, w):
+        return jsonify(error="The picture does not match the photo."), 400
+    bare = bare.astype(np.float32)
+    p = pend["params"]
+    with d.lock:
+        src = d.original.astype(np.float32)
+        result = np.clip(engine.finish(bare, None, p, src, ("blend",)), 0, 255)
+        d.params = p
+        d.deco_order = pend["order"]
+        run = request.form.get("run")
+        d.shots = [s for s in d.shots if s.get("pinned") or (run and s.get("run") == run)]
+        # the other variations, painted on the GPU too (bare: finish them here)
+        for sf in request.files.getlist("shots")[:16]:
+            img = back(cv2.imdecode(np.frombuffer(sf.read(), np.uint8), cv2.IMREAD_COLOR))
+            if img is None or img.shape[:2] != (h, w):
+                continue
+            shot = np.clip(engine.finish(img.astype(np.float32), None, p, src, ("blend",)), 0, 255).astype(np.uint8)
+            d.shots.append({"image": shot, "thumb": fit(shot, 240), "pinned": False,
+                            "manual": False, "id": uuid.uuid4().hex})
+        final = result.astype(np.uint8)
+        d.shots.append({"image": final, "thumb": fit(final, 240), "pinned": False,
+                        "manual": False, "id": uuid.uuid4().hex})
+        d.painting = result.astype(np.float32)
+        d.edited = d.painting.copy()
+        d.height = np.zeros((h, w), np.float32)
+        d.set_layers(bare, np.zeros((h, w), np.float32), ("blend",), None, ran=p, p=p)
+        d.undo.clear()
+        d.redo.clear()
+        d.selected = len(d.shots) - 1
+        d.job = None
+        d.fx_pending = None
+        d.bump()
+        seconds = round(time.time() - pend["t0"], 2)
+    return jsonify(ok=True, version=d.version, seconds=seconds)
 
 
 @app.post("/api/gpu/result")
@@ -563,7 +846,8 @@ def api_gpu_result():
         result = engine.finish(canvas, height, p, src, engine.FINISH_ALL)
         d.params = p
         d.deco_order = pend["order"]
-        d.shots = [s for s in d.shots if s.get("pinned")]
+        run = request.form.get("run")
+        d.shots = [s for s in d.shots if s.get("pinned") or (run and s.get("run") == run)]
         for sf in request.files.getlist("shots")[:16]:
             img = cv2.imdecode(np.frombuffer(sf.read(), np.uint8), cv2.IMREAD_COLOR)
             if img is None or img.shape[:2] != (h, w):
@@ -619,9 +903,21 @@ def api_progress():
 
 @app.post("/api/stop")
 def api_stop():
+    """Stop: the Run gets a moment to stop by itself (a stopped brush
+    painting keeps what was painted); if it is deep in a long step it is
+    let go - its result is thrown away - so the app is free at once."""
     d = doc()
-    if d.job:
-        d.job["stop"] = True
+    job = d.job
+    if job:
+        job["stop"] = True
+        t0 = time.time()
+        while job["running"] and time.time() - t0 < 0.8:
+            time.sleep(0.05)
+        if job["running"]:
+            job["detached"] = True
+            job["error"] = "Stopped — the photo was not changed."
+            job["running"] = False
+            job["progress"] = 1.0
     return jsonify(ok=True)
 
 
@@ -1359,8 +1655,8 @@ def api_act_run():
                 d.edited = d.painting.copy()
                 d.height = np.zeros((h, w), np.float32)
                 d.set_layers(d.painting.copy(), None, ())
-                d.live_cache.reset()
-                d.proxy_cache.reset()
+                d.live_cache = PL.AnalysisCache()   # new object: a preview still using the old one is safe
+                d.proxy_cache = PL.AnalysisCache()
                 d.undo.clear()
                 d.redo.clear()
                 d.shots.append({"image": result, "thumb": fit(result, 240), "pinned": False,

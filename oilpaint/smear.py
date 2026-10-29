@@ -274,19 +274,18 @@ def _settings(p):
     }
 
 
-def _prepare(rgb, st, report):
-    """Steps 1-2: the flat paint and the stroke texture (the slow part)."""
-    h, w = rgb.shape[:2]
-    s = min(h, w) / REF_SIDE
-    seed, detail, relief, base, tilt = st["seed"], st["detail"], st["relief"], st["base"], st["tilt"]
+_REL_CACHE: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 
-    # ---- 1. paint: Oil Paint clean-up, Posterize 10, Cutout, blur 2 ---------
-    report(0.05, "Oil Smear: oil paint")
-    r = max(1.0, 6.0 * s * (1.5 - detail / 100.0))
-    sm = F.guided(F.guided(rgb, r, 0.003), r, 0.003)
-    # Oil Paint's lighting: a fine brush relief along the strokes (light
-    # from -60 deg). The cut-out below breaks the patch edges on it, which
-    # gives the small paint fragments of the template.
+
+def relief_map(h, w, seed, base, tilt):
+    """Oil Paint's lighting: a fine brush relief along the strokes (light
+    from -60 deg), as the light/dark it adds (cached)."""
+    key = (h, w, int(seed), round(float(base), 3), round(float(tilt), 3))
+    hit = _REL_CACHE.get(key)
+    if hit is not None:
+        _REL_CACHE.move_to_end(key)
+        return hit
+    s = min(h, w) / REF_SIDE
     hs_, ws_ = max(8, h // 2), max(8, w // 2)
     # brush marks run the same way as the smear (keeps faces readable)
     ra = (base + tilt * 0.35 * _noise((hs_, ws_), 40 * s + 2,
@@ -299,20 +298,94 @@ def _prepare(rgb, st, report):
     sh = cv2.warpAffine(bh, np.float32([[1, 0, math.cos(a_) * 2 * s + 0.5],
                                         [0, 1, -math.sin(a_) * 2 * s - 0.5]]), (w, h),
                         borderMode=cv2.BORDER_REFLECT)
-    sm = np.clip(sm * (1 + ((bh - sh) * 0.06 * relief)[..., None]), 0, 1)
+    rel = (bh - sh).astype(np.float32)
+    _REL_CACHE[key] = rel
+    while len(_REL_CACHE) > 4:
+        _REL_CACHE.popitem(last=False)
+    return rel
+
+
+def _poster(rgb, st, rel):
+    """Oil Paint clean-up, its brush relief and Posterize 10 (the GPU does
+    the same, static/js/oilfx.js 'Oil Smear')."""
+    h, w = rgb.shape[:2]
+    s = min(h, w) / REF_SIDE
+    r = max(1.0, 6.0 * s * (1.5 - st["detail"] / 100.0))
+    sm = F.guided(F.guided(rgb, r, 0.003), r, 0.003)
+    # the cut-out below breaks the patch edges on the relief, which gives
+    # the small paint fragments of the template
+    sm = np.clip(sm * (1 + (rel * 0.06 * st["relief"])[..., None]), 0, 1)
     # Posterize 10 on the brightness only, so pale grounds do not break
     # into pink and green blotches
     L = F.lum(np.clip(sm, 0, 1))[..., None]
-    po = np.clip(sm * (np.round(L * 9) / 9 + 0.02) / (L + 0.02), 0, 1)
+    return np.clip(sm * (np.round(L * 9) / 9 + 0.02) / (L + 0.02), 0, 1).astype(np.float32)
+
+
+def _prepare(rgb, st, report, ana=None, tex=None):
+    """Steps 1-2: the flat paint and the stroke texture (the slow part)."""
+    h, w = rgb.shape[:2]
+    s = min(h, w) / REF_SIDE
+    seed, base, tilt = st["seed"], st["base"], st["tilt"]
+
+    # ---- 1. paint: Oil Paint clean-up, Posterize 10, Cutout, blur 2 ---------
+    report(0.05, "Oil Smear: oil paint")
+    rel = tex["relief"] if tex else relief_map(h, w, seed, base, tilt)
+    po = _poster(rgb, st, rel)
     report(0.25, "Oil Smear: cut-out")
-    cut = painted.cutout(po.astype(np.float32), s, np.random.default_rng(seed),
-                         levels=st["levels"], detail=detail)
+    cut = painted.cutout(po, s, None, levels=st["levels"], detail=st["detail"], stats=ana)
     paint = _g(cut, 2.0 * s)
 
     # ---- 2. stroke texture ---------------------------------------------------
     report(0.45, "Oil Smear: paint texture")
-    tex = texture(h, w, seed, st["size"], tilt, base)
-    return paint, tex
+    t = tex["tex"] * 255.0 if tex else texture(h, w, seed, st["size"], tilt, base)
+    return paint, t
+
+
+# --------------------------------------------------------------------------
+# for the GPU (static/js/oilfx.js 'Oil Smear'): the random fields, the
+# numbers it cannot find itself, and the same steps on the CPU
+# --------------------------------------------------------------------------
+ASSET_NAMES = ()
+MIN_BY = "short"
+
+
+def tex_key(p):
+    st = _settings(p)
+    return (st["seed"], round(st["size"], 3), round(st["tilt"], 3), round(st["base"], 3))
+
+
+def textures(h, w, p):
+    st = _settings(p)
+    return {"relief": relief_map(h, w, st["seed"], st["base"], st["tilt"]),
+            "tex": texture(h, w, st["seed"], st["size"], st["tilt"], st["base"]) / 255.0}
+
+
+def analyse(rgb, p):
+    """The cut-out's brightness range and colour families (painted.py)."""
+    st = _settings(p)
+    h, w = rgb.shape[:2]
+    s = min(h, w) / REF_SIDE
+    po = _poster(rgb, st, relief_map(h, w, st["seed"], st["base"], st["tilt"]))
+    h2, w2, cs = painted.cutout_res(h, w, s)
+    base = painted.cutout_base(painted._small(po, h2, w2), cs, st["detail"])
+    return painted.cutout_stats(base, st["levels"])
+
+
+def look_payload():
+    x = np.arange(256, dtype=np.float32)
+    tone = np.stack([np.interp(x, _TONE_X, _TONE_Y[c]) / 255.0 for c in range(3)], 1)
+    light = np.interp(x, _LIGHT_X, _LIGHT_Y) / 255.0
+    aux = np.stack([light, _S_CURVE, np.zeros(256)], 1)
+    return {"ref_side": REF_SIDE, "min_side": MIN_SIDE, "min_by": MIN_BY, "textures": True,
+            "analyse": True, "tone": np.round(tone, 6).tolist(), "aux": np.round(aux, 6).tolist(),
+            "cut_sigma": painted.CUT_SIGMA, "wide_step": painted.WIDE_STEP}
+
+
+def apply(rgb, tex, ana, p, report=lambda f, x: None):
+    """The CPU twin of the GPU pipeline (for checks)."""
+    st = _settings(p)
+    paint, t = _prepare(rgb, st, report, ana, tex)
+    return _finish(paint, t, st, st["smear"], report)
 
 
 def _finish(paint, tex, st, smear, report):

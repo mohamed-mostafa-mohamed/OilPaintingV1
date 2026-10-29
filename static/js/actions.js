@@ -107,8 +107,10 @@
     api('/api/actions/open-folder', { method: 'POST' })
       .then(() => toast('Add a pack folder there, then press ↻'))
       .catch(err => toast(err.message, 'bad'));
-  $('#ps-pack').onchange = showPack;
-  $('#ps-action').onchange = scan;
+  /* with Auto-run on, picking a pack or an action plays it right away */
+  const autoPlay = () => { if (pack() && !pack().error) window.autoFire && window.autoFire('#ps-run'); };
+  $('#ps-pack').onchange = () => { showPack(); autoPlay(); };
+  $('#ps-action').onchange = () => { scan(); autoPlay(); };
   $('#ps-brush').onchange = updateButtons;
 
   function startJob(label) {

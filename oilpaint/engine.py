@@ -28,7 +28,10 @@ fast.
 from __future__ import annotations
 
 import math
+import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import numpy as np
@@ -38,6 +41,11 @@ from . import canvas_oil
 from . import halftone
 from . import painted
 from . import impression
+from . import oilfx
+from . import sketchfx
+from . import brushfx
+from . import watercolor
+from . import silkoil
 from . import smear
 from .params import hex_to_bgr
 
@@ -395,9 +403,8 @@ def paint(image_bgr: np.ndarray, p: dict, progress=None, snapshots: int = 8,
     style = p.get("paint_style")
     if style in SEED_KEYS and int(p.get("samples", 8)) > 1 and snapshots > 0:
         return _paint_variations(image_bgr, p, progress, on_snapshot, should_stop)
-    if style == "Canvas Oil":
-        return _paint_canvas_oil(image_bgr, p, progress, snapshots, on_snapshot)
-    if style in ("Halftone", "Painted Photo", "Impression", "Oil Smear"):
+    if style in ("Canvas Oil", "Halftone", "Painted Photo", "Impression", "Oil Smear", "Oil Paint FX", "Sketch Paint",
+                 "Rough Brush", "Watercolor", "Silk Oil"):
         return _paint_halftone(image_bgr, p, progress, on_snapshot)
 
     t_start = time.time()
@@ -565,8 +572,7 @@ def render_plan(plan, p: dict, original: np.ndarray | None = None, seed: int = 0
 
 def draft_strokes(plan, p: dict) -> np.ndarray:
     """A quick sketch of a plan: every stroke as one solid anti-aliased line
-    in its paint colour (no bristles, no relief).  Used for the Canvas Oil
-    live drafts, where the strokes are mixed into many other layers."""
+    in its paint colour (no bristles, no relief)."""
     from . import planner as pl
     canvas = plan.ground.astype(np.float32).copy()
     if not plan.count:
@@ -585,120 +591,268 @@ def draft_strokes(plan, p: dict) -> np.ndarray:
 def paint_draft(image_bgr: np.ndarray, p: dict, cache=None, token=None):
     """A fast, approximate painting for live previews on the server.
 
-    Canvas Oil: the full Canvas Oil pipeline with its brush-stroke layer
-    sketched by :func:`draft_strokes`.  Brush Strokes: the preview plan
+    The filter styles: made at the preview size.  Brush Strokes: the preview plan
     sketched the same way.  Returns the finished (bare) image.
     """
     from . import planner as pl
-    if p.get("paint_style") == "Canvas Oil":
-        result, _, meta = _paint_canvas_oil(image_bgr, p, None, 0, None, draft=True)
-        return meta["canvas"]
-    if p.get("paint_style") in ("Halftone", "Painted Photo", "Impression", "Oil Smear"):
+    if p.get("paint_style") in ("Canvas Oil", "Halftone", "Painted Photo", "Impression", "Oil Smear", "Oil Paint FX",
+                                "Sketch Paint", "Rough Brush", "Watercolor", "Silk Oil"):
         return _halftone_bare(image_bgr, p, draft=True)
     plan = pl.plan_preview(image_bgr, p, cache, token)
     return draft_strokes(plan, p)
 
 
+class PaintStopped(Exception):
+    """Stop was pressed before any variation was finished."""
+
+
+def _variation_workers(n):
+    """How many variations to paint at once. numpy / OpenCV free the
+    interpreter while they work, so several variations run side by side on
+    a multi-core CPU. Override with OILSTUDIO_WORKERS (1 = one at a time)."""
+    env = os.environ.get("OILSTUDIO_WORKERS")
+    if env and env.isdigit():
+        return max(1, min(n, int(env)))
+    cores = os.cpu_count() or 2
+    return max(1, min(n, cores // 2 if cores >= 4 else cores))
+
+
+# ---- Brush Strokes variations in separate processes -------------------------
+_proc_q = None      # set in each worker process: progress messages go back here
+_proc_stop = None   # set in each worker process: Stop pressed
+
+
+def _proc_init(q, stop):
+    global _proc_q, _proc_stop
+    _proc_q, _proc_stop = q, stop
+    try:
+        cv2.setNumThreads(1)          # the processes already use every core
+    except Exception:                 # noqa: BLE001
+        pass
+
+
+def _proc_variation(i, image_bgr, q):
+    """One Brush Strokes variation, in a worker process."""
+    def report(f, label):
+        if _proc_stop is not None and _proc_stop.is_set():
+            raise PaintStopped()
+        if _proc_q is not None:
+            _proc_q.put((i, float(f), label))
+    try:
+        result, _, meta = paint(image_bgr, dict(q, samples=1), progress=report, snapshots=0)
+    except PaintStopped:
+        return i, None, None
+    meta = {k: v for k, v in meta.items() if k != "plan"}
+    return i, result, meta
+
+
+def _process_pool(workers):
+    """A pool of worker processes, or None where processes cannot be used."""
+    if os.environ.get("OILSTUDIO_NO_PROCESSES"):
+        return None
+    try:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        from concurrent.futures import ProcessPoolExecutor
+        q, stop = ctx.Queue(), ctx.Event()
+        pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
+                                   initializer=_proc_init, initargs=(q, stop))
+        return pool, q, stop
+    except Exception:                 # noqa: BLE001 - fall back to threads
+        return None
+
+
+def kill_pool(pool):
+    """End a process pool's workers now (Stop), not after their step."""
+    try:
+        for pr in list(getattr(pool, "_processes", {}).values()):
+            pr.terminate()
+    except Exception:                 # noqa: BLE001
+        pass
+
+
+def _paint_variations_proc(image_bgr, p, progress, on_snapshot, should_stop, key, n, base):
+    """Brush Strokes: the variations side by side in worker processes."""
+    import queue as _queue
+    from concurrent.futures.process import BrokenProcessPool
+    workers = _variation_workers(n)
+    made = _process_pool(workers) if workers > 1 else None
+    if made is None:
+        return None
+    pool, q, stop = made
+    t_start = time.time()
+    frac = [0.0] * n
+    results, done_order, meta = {}, [], None
+    jobs = []
+    for i in range(n - 1, -1, -1):              # the chosen one (last) starts first
+        qq = dict(p)
+        qq[key] = (base + i + 1) % 10000 if i < n - 1 else base
+        jobs.append(pool.submit(_proc_variation, i, image_bgr, qq))
+    try:
+        pending = set(jobs)
+        while pending:
+            # progress from the workers
+            try:
+                while True:
+                    i, f, label = q.get_nowait()
+                    frac[i] = max(frac[i], f)
+                    if progress:
+                        done = sum(1 for x in frac if x >= 1.0)
+                        progress(sum(frac) / n, f"{label} — {done} of {n} variations done")
+            except _queue.Empty:
+                pass
+            except (EOFError, OSError):
+                pass
+            if should_stop and should_stop() and not stop.is_set():
+                stop.set()
+                for f in pending:
+                    f.cancel()
+                kill_pool(pool)                 # free the CPU at once
+                break
+            finished = [f for f in pending if f.done()]
+            for fut in finished:
+                pending.discard(fut)
+                if fut.cancelled():
+                    continue
+                try:
+                    i, result, m = fut.result()  # a real error is raised here
+                except BrokenProcessPool:
+                    if stop.is_set():
+                        continue
+                    # worker processes could not start (some packaged builds):
+                    # paint the old way, one variation after another
+                    if not results:
+                        return None
+                    raise
+                if result is None:
+                    continue
+                frac[i] = 1.0
+                results[i] = result
+                if meta is None or i == n - 1:
+                    meta = m
+                if i != n - 1:
+                    done_order.append(i)
+                    if on_snapshot:
+                        on_snapshot(len(done_order) - 1, result)
+            if pending and not finished:
+                time.sleep(0.1)
+    finally:
+        stop.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+    if not results:
+        raise PaintStopped()
+    stopped = len(results) < n
+    if (n - 1) in results:
+        chosen = n - 1
+        if on_snapshot:
+            on_snapshot(len(done_order), results[chosen])
+    else:
+        chosen = done_order[-1]
+    shots = [results[k] for k in done_order if k != chosen] + [results[chosen]]
+    meta = dict(meta)
+    meta["seconds"] = round(time.time() - t_start, 2)
+    meta["stopped"] = stopped
+    return results[chosen], shots, meta
+
+
 def _paint_variations(image_bgr, p, progress, on_snapshot, should_stop):
     """The template styles: several variations of the same settings, each
     with its own random seed (new strokes, smears, grain...), shown in the
-    Timeline one by one as they finish. The chosen seed is the last one, so
-    the result after a full Run is exactly the settings on screen."""
+    Timeline as they finish. The chosen seed is the last one (always shown
+    last), so the result after a full Run is exactly the settings on screen.
+
+    The variations are painted side by side on the CPU cores, and Stop is
+    checked inside every progress step - not only after a whole variation -
+    so a stopped Run frees the CPU at once."""
     from .params import SEED_KEYS
     t_start = time.time()
     style = p.get("paint_style")
     key = SEED_KEYS[style]
     n = int(np.clip(int(p.get("samples", 8)), 1, 16))
     base = int(p.get(key, 1))
-    shots, meta, stopped = [], None, False
-    for i in range(n):
+    if style == "Brush Strokes" and n > 1:
+        out = _paint_variations_proc(image_bgr, p, progress, on_snapshot, should_stop, key, n, base)
+        if out is not None:
+            return out
+    stop_flag = threading.Event()
+    lock = threading.Lock()
+    frac = [0.0] * n
+    last_label = [""]
+
+    def stopping():
+        if stop_flag.is_set():
+            return True
+        if should_stop and should_stop():
+            stop_flag.set()
+            return True
+        return False
+
+    def one(i):
         q = dict(p)
         q[key] = (base + i + 1) % 10000 if i < n - 1 else base
 
-        def report(f, label, i=i):
+        def report(f, label):
+            if stopping():
+                raise PaintStopped()
+            with lock:
+                frac[i] = max(frac[i], float(f))
+                done = sum(1 for x in frac if x >= 1.0)
+                last_label[0] = label
+                total = sum(frac) / n
             if progress:
-                progress((i + float(f)) / n, f"{label} — variation {i + 1} of {n}")
-        if style == "Canvas Oil":
-            result, _, meta = _paint_canvas_oil(image_bgr, q, report, 0, None)
+                progress(total, f"{label} — {done} of {n} variations done")
+        if stopping():
+            raise PaintStopped()
+        if style == "Brush Strokes":
+            result, _, meta = paint(image_bgr, dict(q, samples=1), progress=report, snapshots=0)
         else:
             result, _, meta = _paint_halftone(image_bgr, q, report, None)
-        shots.append(result)
+        with lock:
+            frac[i] = 1.0
+        return i, result, meta
+
+    results, done_order = {}, []
+    meta = None
+    order = list(range(n - 1, -1, -1))        # the chosen one (last) starts first
+    # Brush Strokes only lands here when processes are not available: its stroke
+    # loop is pure Python, so threads would only wait on each other
+    with ThreadPoolExecutor(max_workers=1 if style == "Brush Strokes" else _variation_workers(n),
+                            thread_name_prefix="variation") as pool:
+        futs = [pool.submit(one, i) for i in order]
+        for fut in as_completed(futs):
+            try:
+                i, result, m = fut.result()
+            except PaintStopped:
+                continue
+            except Exception:
+                stop_flag.set()                 # a real error: stop the rest too
+                for f in futs:
+                    f.cancel()
+                raise
+            results[i] = result
+            if meta is None or i == n - 1:
+                meta = m
+            if i != n - 1:                      # extra variations go to the Timeline as they finish
+                done_order.append(i)
+                if on_snapshot:
+                    on_snapshot(len(done_order) - 1, result)
+            if stop_flag.is_set():
+                for f in futs:
+                    f.cancel()
+    if not results:
+        raise PaintStopped()
+    stopped = len(results) < n
+    if (n - 1) in results:                      # the settings on screen: shown last, used
+        chosen = n - 1
         if on_snapshot:
-            on_snapshot(i, result)
-        if should_stop and should_stop() and i < n - 1:
-            stopped = True
-            break
+            on_snapshot(len(done_order), results[chosen])
+    else:                                       # stopped early: the last one that finished
+        chosen = done_order[-1]
+    shots = [results[k] for k in done_order if k != chosen] + [results[chosen]]
     meta = dict(meta)
     meta["seconds"] = round(time.time() - t_start, 2)
     meta["stopped"] = stopped
-    return shots[-1], shots, meta
-
-
-def _paint_canvas_oil(image_bgr, p, progress, snapshots, on_snapshot, draft=False):
-    """The "Canvas Oil" style (see canvas_oil.py), with the same Abstract
-    Art, blending and Timeline behaviour as the brush engine."""
-    t_start = time.time()
-    src = image_bgr.astype(np.float32)
-    work = src
-    if p["abstract_enabled"]:
-        if p["dist_strength"] > 0:
-            work = ab.distort(work, p)
-        work = ab.correct(work, p)
-
-    shots = []
-
-    def stage(img):
-        if snapshots > 0:
-            shots.append(img)
-            if on_snapshot:
-                on_snapshot(len(shots) - 1, img)
-
-    def brush(image, report):
-        """Paint ``image`` over with the stroke engine, tuned to sit on top
-        of the Canvas Oil patches: the patches are already simplified, so
-        the strokes only have to follow them and lay the paint on."""
-        size = float(p.get("co_stroke_size", 45)) / 100.0
-        loose = float(p.get("co_loose", 55)) / 100.0
-        q = dict(p)
-        q.update(paint_style="Brush Strokes", abstract_enabled=0, edge_enabled=0,
-                 blend_original=0, guides=p.get("guides") or [],
-                 simplicity=1 + int(3 * loose),
-                 direction=int(18 + 20 * loose), global_angle=60,
-                 wide_bg_strokes=6,
-                 # loose: uneven, mixing, broken-edged strokes that leave
-                 # gaps where the patches show through
-                 expression=int(25 + 55 * loose),
-                 filling=int(97 - 22 * loose),
-                 relief=int(48 + 20 * loose), lightening=0,
-                 stroke_thickness=int(6 + 22 * size),
-                 max_stroke_length=int(16 + 20 * size + 24 * loose),
-                 min_stroke_length=int(35 - 15 * loose),
-                 hair_thickness=int(30 - 12 * loose), brush_density=int(58 - 18 * loose),
-                 intensity=int(74 + 12 * loose), random_seed=int(p.get("co_seed", 7)))
-        if draft:
-            from . import planner as pl
-            plan = pl.plan_preview(image, q)
-            return draft_strokes(plan, q)
-        out, _, _ = paint(image, q, progress=report, snapshots=0)
-        return out
-
-    bare = np.clip(canvas_oil.render(work, p, progress=progress, on_stage=stage,
-                                     brush=brush), 0, 255).astype(np.float32)
-    result = bare
-    blend = float(p["blend_original"]) / 100.0
-    if blend > 0.002:
-        result = blend_images(result, src, blend, p.get("blend_mode", "Normal"))
-    result = np.clip(result, 0, 255)
-    shots.append(result)
-    if on_snapshot:
-        on_snapshot(len(shots) - 1, result)
-    h, w = src.shape[:2]
-    # Canvas Oil lights its own relief; only Blend with Original is applied
-    # on top, so that is the only finishing step the workspace may redo
-    return result, shots, {"strokes": 0, "seconds": round(time.time() - t_start, 2),
-                           "stopped": False, "size": [w, h], "style": "Canvas Oil",
-                           "canvas": bare, "height": np.zeros((h, w), np.float32),
-                           "finish": ("blend",)}
+    return results[chosen], shots, meta
 
 
 def _halftone_bare(image_bgr, p, progress=None, draft=False):
@@ -708,7 +862,9 @@ def _halftone_bare(image_bgr, p, progress=None, draft=False):
         if p["dist_strength"] > 0:
             work = ab.distort(work, p)
         work = ab.correct(work, p)
-    mod = {"Painted Photo": painted, "Impression": impression, "Oil Smear": smear}.get(p.get("paint_style"), halftone)
+    mod = {"Canvas Oil": canvas_oil, "Painted Photo": painted, "Impression": impression, "Oil Smear": smear,
+           "Oil Paint FX": oilfx, "Sketch Paint": sketchfx,
+           "Rough Brush": brushfx, "Watercolor": watercolor, "Silk Oil": silkoil}.get(p.get("paint_style"), halftone)
     if draft:      # live preview: made at the preview size itself (fast)
         out = mod.render(work, p, progress=progress, min_side=0)
     else:

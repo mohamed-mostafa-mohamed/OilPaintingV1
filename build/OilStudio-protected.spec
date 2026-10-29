@@ -31,6 +31,9 @@ for entry in sorted(os.listdir("ps_actions")) if os.path.isdir("ps_actions") els
     datas.append((pack_dir, pack_dir.replace(os.sep, "/")))
 if os.path.isdir("samples"):
     datas.append(("samples", "samples"))
+for _r in ("oil_fx", "sketch_paint", "rough_brush", "watercolor", "silk_oil"):              # template pictures of the filter styles
+    if os.path.isdir("recipes/" + _r):
+        datas.append(("recipes/" + _r, "recipes/" + _r))
 
 # PyInstaller cannot see the imports inside compiled modules: protect.py
 # listed them; keep the ones that exist on this system

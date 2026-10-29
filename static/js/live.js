@@ -1,3 +1,24 @@
+/* Problems with the graphics card are written to workdir/gpu_log.txt (with
+   the card's name), so they can be looked at after the fact. */
+window.logGpu = (where, err, extra) => {
+  try {
+    if (!window._gpuName) {
+      try {
+        const g = document.createElement('canvas').getContext('webgl2');
+        const x = g && g.getExtension('WEBGL_debug_renderer_info');
+        window._gpuName = g ? (x ? g.getParameter(x.UNMASKED_RENDERER_WEBGL) : g.getParameter(g.RENDERER)) : 'no WebGL 2';
+      } catch (e) { window._gpuName = '?'; }
+    }
+    const msg = err && err.message ? err.message : String(err);
+    console.warn('[gpu]', where, msg);
+    fetch('/api/log', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ where, msg, stack: err && err.stack ? String(err.stack).slice(0, 2000) : '',
+        gpu: window._gpuName, ua: navigator.userAgent, extra: extra || null }) }).catch(() => {});
+  } catch (e) { /* never fail because of the log */ }
+};
+window.addEventListener('error', e => window.logGpu('page', e.error || e.message));
+window.addEventListener('unhandledrejection', e => window.logGpu('promise', e.reason));
+
 /* OilStudio live preview (WebGL 2) ---------------------------------------
    Makes every slider update the After image while it moves.
 
@@ -43,7 +64,8 @@
 
   /* ======================================================== settings keys */
   function strokeKeys(p) {
-    return Object.keys(p).filter(k => !isPost(k) && k !== 'guides').sort();
+    /* 'samples' (Takes) only says how many variations a Run makes */
+    return Object.keys(p).filter(k => !isPost(k) && k !== 'guides' && k !== 'samples').sort();
   }
   /* the guiding lines as params.clean() keeps them */
   function guidesKey(g) {
@@ -213,6 +235,19 @@
     return sign | (e << 10) | ((x & 0x7fffff) >>> 13);
   }
   const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
+  /* after the next frame has been drawn (rAF runs just before the paint; the
+     timer after it); a timer backs it up in a hidden window */
+  const shownFrame = () => new Promise(r => {
+    let done = false; const go = () => { if (!done) { done = true; r(); } };
+    requestAnimationFrame(() => setTimeout(go, 0)); setTimeout(go, 100);
+  });
+  /* indices per draw call in a full-size GPU Run (a multiple of 3) */
+  const SLICE_IDX = 3 * 120000;
+  /* wait for the GPU to catch up; rAF stops in a hidden window, so a timer backs it up */
+  const yieldGPU = () => new Promise(r => {
+    let done = false; const go = () => { if (!done) { done = true; r(); } };
+    requestAnimationFrame(go); setTimeout(go, 50);
+  });
 
   /* ======================================================== plan parsing */
   function parsePlan(buf) {
@@ -410,7 +445,9 @@
     return hls2rgb(ah); }
   void main(){
     ivec2 p = ivec2(gl_FragCoord.xy);
-    vec3 c = texelFetch(uCol, p, 0).rgb*255.;
+    /* a quick preview made smaller (while a slider is dragged) is stretched here */
+    vec3 c = (textureSize(uCol, 0) == uDim ? texelFetch(uCol, p, 0).rgb
+              : texture(uCol, (vec2(p) + .5) / vec2(uDim)).rgb)*255.;
     if((uSteps & 1) != 0 && uRelief > .005){
       float gx = h(p+ivec2(1,-1))+2.*h(p+ivec2(1,0))+h(p+ivec2(1,1)) - h(p+ivec2(-1,-1))-2.*h(p+ivec2(-1,0))-h(p+ivec2(-1,1));
       float gy = h(p+ivec2(-1,1))+2.*h(p+ivec2(0,1))+h(p+ivec2(1,1)) - h(p+ivec2(-1,-1))-2.*h(p+ivec2(0,-1))-h(p+ivec2(1,-1));
@@ -522,6 +559,7 @@
       this.draftBusy = false; this.wantDraft = null;
       this.raf = 0;
       this.dirty = { strokes: true, height: true };
+      this.lost = false;
       try { this._init(); } catch (err) { console.warn('Live preview unavailable:', err); }
     }
 
@@ -529,11 +567,43 @@
       const cv = document.createElement('canvas');
       cv.id = 'live-canvas';
       cv.hidden = true;
+      /* ask for the fast (discrete) graphics card on laptops with two */
       const gl = cv.getContext('webgl2', { antialias: false, premultipliedAlpha: false,
-        preserveDrawingBuffer: true, alpha: false });
-      if (!gl) return;
-      if (!gl.getExtension('EXT_color_buffer_float')) return;
+        preserveDrawingBuffer: true, alpha: false, powerPreference: 'high-performance' });
+      if (!gl) { console.warn('Live preview: WebGL 2 is not available (GPU off or blocked).'); return; }
       this.canvas = cv; this.gl = gl;
+      /* The GPU can drop the context at any time (driver reset after a long
+         draw, sleep, another app taking the card).  Before this the app kept
+         using a dead context: black paintings, frozen sliders.             */
+      cv.addEventListener('webglcontextlost', e => {
+        e.preventDefault();               /* lets the browser give it back */
+        console.warn('Live preview: the GPU context was lost.');
+        if (window.logGpu) window.logGpu('context lost (preview)', 'the graphics card dropped the live preview',
+          JSON.stringify({ mode: this.mode, style: this.params && this.params.paint_style, last: window.OilFX && window.OilFX.lastTimes }));
+        this.lost = true; this.supported = false; this.active = false;
+        if (this.raf) { cancelAnimationFrame(this.raf); this.raf = 0; }
+        this._emit('lost');
+      });
+      cv.addEventListener('webglcontextrestored', () => {
+        console.info('Live preview: the GPU context is back.');
+        try {
+          this._resetResources();
+          this.lost = false;
+          this._setupGL();
+          this._emit('restored');
+        } catch (err) { console.warn('Live preview: could not restart on the GPU:', err); }
+      });
+      this._setupGL();
+    }
+
+    /* everything that lives on the GPU: made at start and after a context loss */
+    _setupGL() {
+      const gl = this.gl;
+      if (!gl.getExtension('EXT_color_buffer_float')) {
+        console.warn('Live preview: this GPU cannot render to float textures (EXT_color_buffer_float).');
+        this.supported = false;
+        return;
+      }
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
       gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
@@ -551,6 +621,26 @@
       this.dummy = this._tex(1, 1, 'rgba8', new Uint8Array([0, 0, 0, 0]));
       this.pool = {};
       this.supported = true;
+    }
+    /* a lost context frees every GPU object: forget them so they are made again */
+    _resetResources() {
+      this.pool = {};
+      this.texCanvas = this.texOrig = this.texHeightA = this.texEdits = null;
+      this.texDraft = this.texGround = this.texData = null;
+      this.mesh = null; this.vao = null; this.indexCount = 0;
+      this.plan = null; this.lookKey = null; this.draftKey = null; this.draftStyle = null;
+      this.inflightPlan = null; this.inflightDraft = null;
+      this.overlays = {};
+      this.dirty = { strokes: true, height: true, heightA: true };
+      this.state = null; this.active = false;
+    }
+    /* true when the GPU can be used right now */
+    get ok() { return this.supported && !this.lost && !!this.gl && !this.gl.isContextLost(); }
+    _checkGL(what) {
+      if (!this.gl || this.gl.isContextLost()) {
+        this.lost = true; this.supported = false; this.active = false;
+        throw new Error('The graphics card stopped responding' + (what ? ' (' + what + ')' : ''));
+      }
     }
 
     /* -------------------------------------------------- GL plumbing */
@@ -663,7 +753,7 @@
 
     /* the painting changed on the server (Run, Timeline, Photoshop, open) */
     async load() {
-      if (!this.supported) return false;
+      if (!this.ok) return false;
       const st = await (await fetch('/api/live/state', { cache: 'no-store' })).json();
       if (!st.painted) { this.active = false; this.state = null; return false; }
       const get = name => fetch('/api/live/layer/' + name + '?v=' + st.version + '_' + Date.now(), { cache: 'no-store' });
@@ -679,7 +769,10 @@
         this.reliefScaleA = parseFloat(rh.headers.get('X-Relief-Scale')) || 1;
       } else this.texHeightA = null;
       await this._loadEdits(re);
-      this.plan = null; this.lookKey = null; this.draftKey = null;
+      this._checkGL('loading the painting');
+      this.plan = null; this.lookKey = null; this.draftKey = null; this.draftStyle = null;
+      this.draftGen = (this.draftGen || 0) + 1;          /* drafts still on their way are for the old painting */
+      this.wantDraft = null; this.wantPlan = null;
       this.dirty.strokes = true;
       this.ranStrokeKey = st.ran ? strokeKey(st.ran) : null;
       this.ranLayoutKey = st.ran ? layoutKey(st.ran) : null;
@@ -711,13 +804,16 @@
       const sk = strokeKey(p);
       let mode = 'A';
       if (this.ranStrokeKey !== null && sk !== this.ranStrokeKey)
-        mode = ['Canvas Oil', 'Halftone', 'Painted Photo', 'Impression', 'Oil Smear'].includes(p.paint_style) ? 'C' : 'B';
+        mode = ['Canvas Oil', 'Halftone', 'Painted Photo', 'Impression', 'Oil Smear', 'Oil Paint FX',
+          'Sketch Paint', 'Rough Brush', 'Watercolor', 'Silk Oil'].includes(p.paint_style) ? 'C' : 'B';
       /* a Timeline shot or a Photoshop result has no strokes to restyle */
       if (!this.state.ran) mode = 'A';
+      /* holding for an auto-run: keep showing the last real painting */
+      if (this.holdPreview) mode = 'A';
       const modeChanged = mode !== this.mode;
       this.mode = mode;
 
-      if (mode === 'B') {
+      if (mode === 'B' && !this.holdPreview) {
         const lk = layoutKey(p);
         if (this.plan && this.plan.layoutKey === lk && !(this.plan.proxy && !dragging)) {
           /* same strokes: only their look changed */
@@ -728,7 +824,7 @@
           this._requestPlan({ source: 'preview', params: p, proxy: dragging, key: lk });
         }
         if (this.plan && this.lookKey !== this._lookKey(p)) this._restyle();
-      } else if (mode === 'C') {
+      } else if (mode === 'C' && !this.holdPreview) {
         this._requestDraft(p, dragging);
       }
       if (modeChanged) this._emit('mode');
@@ -758,15 +854,23 @@
       const want = this.wantPlan; this.wantPlan = null;
       this.planBusy = true; this.inflightPlan = want.id;
       this._emit('busy');
+      const t0 = performance.now();
       try {
         const res = await fetch('/api/live/plan', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ source: want.source, params: want.params, proxy: !!want.proxy })
         });
         if (res.status === 200) {
+          const t1 = performance.now();
           const plan = parsePlan(await res.arrayBuffer());
           plan.layoutKey = want.key; plan.id = want.id; plan.proxy = !!want.proxy;
           this._setPlan(plan);
+          if (this.wantPlan) await shownFrame();      /* on screen before the next plan */
+          const n = (this.timeLogs = (this.timeLogs || 0) + 1);
+          if (window.logGpu && n <= 60) window.logGpu('preview time', JSON.stringify({ style: 'Brush Strokes',
+            proxy: !!want.proxy, strokes: plan.n, server_ms: Math.round(t1 - t0),
+            server_plan_ms: Math.round(1000 * Number(res.headers.get('X-Plan-Seconds') || 0)),
+            gpu_ms: Math.round(performance.now() - t1) }));
         }
       } catch (err) { console.warn(err); }
       this.planBusy = false; this.inflightPlan = null;
@@ -818,6 +922,7 @@
        Returns the bare painting (PNG), the paint height (float16) and the
        Timeline shots (JPEG), or null when stopped.                        */
     async paintFull(plan, p, { snapshots = 8, onProgress, shouldStop } = {}) {
+      this._checkGL('before painting');
       const gl = this.gl, w = plan.w, h = plan.h;
       const max = gl.getParameter(gl.MAX_TEXTURE_SIZE);
       if (w > max || h > max) throw new Error('The picture is too large for this graphics card.');
@@ -829,6 +934,7 @@
       const col = this._target('runPaint', w, h, 'rgba8');
       const hgt = this._target('runHeight', w, h, 'r16f');
       const cleanup = () => {
+        if (gl.isContextLost()) { delete this.pool.runPaint; delete this.pool.runHeight; return; }
         gl.deleteVertexArray(mesh.vao); gl.deleteBuffer(mesh.vbo); gl.deleteBuffer(mesh.ibo);
         gl.deleteTexture(texData); gl.deleteTexture(texGround);
         for (const k of ['runPaint', 'runHeight']) {
@@ -855,19 +961,27 @@
           const upto = Math.round(plan.n * c / chunks);
           const i0 = doneStrokes ? mesh.ends[doneStrokes - 1] : 0;
           const i1 = upto ? mesh.ends[upto - 1] : 0;
-          if (i1 > i0) {
+          /* small slices, a frame apart: one huge draw at full size can run
+             past the driver's time limit (Windows TDR ~2 s), which resets
+             the GPU and kills the context mid-paint                          */
+          for (let s0 = i0; s0 < i1; s0 += SLICE_IDX) {
+            if (shouldStop && shouldStop()) return null;
+            const n = Math.min(SLICE_IDX, i1 - s0);
             gl.enable(gl.BLEND);
             gl.bindVertexArray(mesh.vao);
             this._bindTarget(col);
             gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE);
             this._use(this.prog.stroke, { uData: texData, uSize: [w, h], uPass: { i: 0 } });
-            gl.drawElements(gl.TRIANGLES, i1 - i0, gl.UNSIGNED_INT, i0 * 4);
+            gl.drawElements(gl.TRIANGLES, n, gl.UNSIGNED_INT, s0 * 4);
             this._bindTarget(hgt);
             gl.blendFunc(gl.ONE, gl.ONE);
             this._use(this.prog.stroke, { uData: texData, uSize: [w, h], uPass: { i: 1 } });
-            gl.drawElements(gl.TRIANGLES, i1 - i0, gl.UNSIGNED_INT, i0 * 4);
+            gl.drawElements(gl.TRIANGLES, n, gl.UNSIGNED_INT, s0 * 4);
             gl.bindVertexArray(null);
             gl.disable(gl.BLEND);
+            gl.flush();
+            if (i1 - i0 > SLICE_IDX) await yieldGPU();
+            this._checkGL('painting the strokes');
           }
           doneStrokes = upto;
           if (c < chunks) shots.push(await this._readColour(col, 'image/jpeg', 0.92));
@@ -876,6 +990,8 @@
         }
         const canvas = await this._readColour(col, 'image/png');
         const height = this._readHeight(hgt);
+        /* a context lost during read-back gives all-zero pixels: a black painting */
+        this._checkGL('reading the painting back');
         return { canvas, height, shots, w, h, seconds: (performance.now() - t0) / 1000 };
       } finally {
         cleanup();
@@ -908,9 +1024,12 @@
 
     /* -------------------------------------------------- Canvas Oil drafts */
     _requestDraft(p, dragging) {
-      const key = strokeKey(p) + (dragging ? '|proxy' : '|full');
+      /* a GPU style is previewed at ONE size, dragging or not: letting go
+         of a slider must not change the picture */
+      const gpu = window.OilFX && window.OilFX.ok && window.OilFX.has(p.paint_style);
+      const key = strokeKey(p) + (gpu ? '|gpu' : dragging ? '|proxy' : '|full');
       if (this.draftKey === key || this.inflightDraft === key) return;
-      this.wantDraft = { p, dragging, key };
+      this.wantDraft = { p, dragging, key, gen: this.draftGen };
       this._pumpDraft();
     }
     async _pumpDraft() {
@@ -918,23 +1037,98 @@
       const want = this.wantDraft; this.wantDraft = null;
       this.draftBusy = true; this.inflightDraft = want.key;
       this._emit('busy');
+      const t0 = performance.now();
       try {
-        const res = await fetch('/api/live/draft', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ params: want.p, proxy: want.dragging })
-        });
-        if (res.status === 200) {
-          const bm = await decodeImage(await res.blob());
-          this.texDraft = this._texFromImage(bm, this.texDraft);
-          this.draftKey = want.key;
-          this.invalidate();
+        let res;
+        if (window.OilFX && window.OilFX.ok && window.OilFX.has(want.p.paint_style)) {
+          /* the GPU filter styles preview on the GPU itself (static/js/oilfx.js) */
+          res = await this._fxDraft(want.p, want.dragging);
+        } else {
+          res = await fetch('/api/live/draft', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ params: want.p, proxy: want.dragging })
+          });
         }
-      } catch (err) { console.warn(err); }
+        /* a draft of another style (one was picked meanwhile, or a Run
+           finished) is old: drop it. A draft of this style whose sliders
+           have moved on since is still the nearest picture: show it while
+           the next one is made (while dragging, every draft is a little
+           behind the slider - dropping them would show nothing new) */
+        const stillWanted = this.params && this.mode === 'C' && !this.holdPreview &&
+          want.p.paint_style === this.params.paint_style && want.gen === this.draftGen;
+        if (res.status === 200 && stillWanted) {
+          const bm = res.bitmap || await decodeImage(await res.blob());
+          this.texDraft = this._texFromImage(bm, this.texDraft);
+          if (bm.close) bm.close();
+          this.draftKey = want.key; this.draftStyle = want.p.paint_style;
+          this.invalidate();
+          /* let the screen show it before the next one is started: back to
+             back, the drafts can keep the page so busy that the picture
+             only changes when the mouse is let go (seen on Windows) */
+          if (this.wantDraft) await shownFrame();
+          /* how long a preview takes, written to workdir/gpu_log.txt (a few
+             per style), so slow steps can be found on any computer */
+          const tm = Object.assign({ total_ms: Math.round(performance.now() - t0), dragging: !!want.dragging },
+            (window.OilFX && window.OilFX.lastTimes) || {});
+          const n = (this.timeLogs = (this.timeLogs || 0) + 1);
+          if (window.logGpu && n <= 60) window.logGpu('preview time', JSON.stringify(tm));
+        }
+      } catch (err) { window.logGpu('live draft', err); }
       this.draftBusy = false; this.inflightDraft = null;
       this._emit('busy');
       if (this.wantDraft) this._pumpDraft();
     }
     get busy() { return this.planBusy || this.draftBusy; }
+    /* a GPU filter style's preview made on the GPU, shaped like a server reply */
+    /* like Photoshop: while a slider is dragged the style is made on a
+       small proxy (fast), the full preview follows when it is let go; the
+       stages a moved setting does not touch are kept on the card */
+    async _fxDraft(p, dragging) {
+      const v = (this.state && this.state.version) + '';
+      if (this.fxSrcVersion !== v || !this.fxSrc) {
+        const src = await window.OilFX.bitmap('/api/live/layer/original?v=' + v + '_' + Date.now());
+        if (this.fxSrcKey !== src.width + 'x' + src.height + '|' + (this.state && this.state.token)) window.OilFX.release();
+        this.fxSrc = src; this.fxSrcVersion = v;
+        this.fxSrcKey = src.width + 'x' + src.height + '|' + (this.state && this.state.token);
+      }
+      /* keepSize: a small proxy goes on the card as it is and is stretched
+         there (enlarging it first cost ~60 ms per draft) */
+      const style = p.paint_style;
+      this.fxSide = this.fxSide || {};
+      const side = this.fxSide[style] || FX_FULL;
+      const bitmap = await window.OilFX.runBitmap(this.fxSrc, p, { proxy: side, memo: true, keepSize: true });
+      window.OilFX.lastShownSide = Math.max(bitmap.width, bitmap.height);
+      if (!this.fxSide[style]) await this._fxMeasure(style, p);
+      return { status: 200, bitmap };
+    }
+    /* Like Photoshop's proxy, but the same while dragging and after: the
+       preview size of a style is picked once from how fast this graphics
+       card makes it (a whole preview in about FX_BUDGET ms), so dragging
+       stays smooth and letting go does not swap in a different picture.
+       A fast card gets FX_FULL; a slow one a smaller (softer) preview. */
+    async _fxMeasure(style, p) {
+      let t = window.OilFX.lastTimes || {};
+      if (!t.fresh || t.style !== style) {
+        /* that one was not a fair timing (steps kept or just built): time a small one */
+        const t0 = performance.now();
+        await window.OilFX.run(this.fxSrc, p, null, { raw: true, proxy: FX_MIN, memo: false });
+        t = Object.assign({}, window.OilFX.lastTimes, { gpu_ms: performance.now() - t0 - (window.OilFX.lastTimes.server_ms || 0) });
+      }
+      const made = Math.max(t.w, t.h), ms = Math.max(1, t.gpu_ms);
+      let side = Math.round(made * Math.sqrt(FX_BUDGET / ms) / 16) * 16;
+      side = Math.max(FX_MIN, Math.min(FX_FULL, side));
+      this.fxSide[style] = side;
+      if (window.logGpu) window.logGpu('preview size', JSON.stringify({ style, side, timed_at: made, ms: Math.round(ms) }));
+      /* the preview on screen was made at another size: make it again now,
+         before any slider is touched */
+      const shown = window.OilFX.lastShownSide || made;
+      if (Math.min(side, Math.max(this.fxSrc.width, this.fxSrc.height)) !== shown)
+        setTimeout(() => {
+          if (!this.params || this.params.paint_style !== style) return;
+          this.draftKey = null; this.inflightDraft = null;
+          this._requestDraft(this.params, false);
+        }, 0);
+    }
 
     /* -------------------------------------------------- decoration layers */
     /* the size of the picture as it enters each decoration */
@@ -1066,7 +1260,7 @@
     }
 
     render() {
-      if (!this.active || !this.P || !this.params) return;
+      if (!this.active || !this.P || !this.params || !this.ok) return;
       const gl = this.gl, p = this.params, [w, h] = this.P;
       const ivec = a => Object.assign(a, { isInt: true });
       let colour, steps, scale = 1, hblur = null;
@@ -1079,9 +1273,17 @@
           this.dirty.strokes = false;
         }
         colour = this.pool.paint; steps = 7; scale = this.reliefScaleB; hblur = this.pool.hblurB;
-      } else if (this.mode === 'C' && this.texDraft) {
-        colour = this.texDraft; steps = 4;
+      } else if (this.mode === 'C' && this.texDraft && this.draftStyle === p.paint_style) {
+        /* the newest preview of this style (it may be a step behind the
+           slider while dragging - the next one is on its way) */
+        colour = this.texDraft; steps = 4; this.shown = 'draft';
+      } else if (this.mode === 'C' && !(this.state.ran && this.state.ran.paint_style === p.paint_style)) {
+        /* no preview of this style yet: the painting on screen belongs to
+           another style - keep the last picture until the preview comes */
+        this.shown = 'kept';
+        return;
       } else {
+        this.shown = this.mode === 'B' ? 'strokes' : 'painting';
         colour = this.texCanvas;
         steps = (this.state.finish.includes('relief') ? 1 : 0) |
           (this.state.finish.includes('lightening') ? 2 : 0) | (this.state.finish.includes('blend') ? 4 : 0);
@@ -1179,5 +1381,8 @@
     snapshot() { return this.canvas.toDataURL('image/png'); }
   }
 
+  const FX_MIN = 720;            /* long side of a GPU style's preview: at least this... */
+  const FX_FULL = 1600;          /* ... at most this (a Run is full size) */
+  const FX_BUDGET = 220;         /* ms one preview may take: the size is picked for it (_fxMeasure) */
   window.OilLive = { Live, layoutKey, strokeKey, isPost, LOOK_KEYS, styleStrokes, parsePlan };
 })();
