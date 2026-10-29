@@ -44,7 +44,7 @@ import zlib
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # what goes into the release
-CODE = ["app.py", "desktop.py", "oilpaint", "actions"]
+CODE = ["app.py", "desktop.py", "oilpaint", "actions", "engine"]   # engine: psd_recipe (Watercolor, Sketch Paint, Rough Brush)
 DATA = ["samples", "ps_actions", "recipes", "requirements.txt"]
 EMBED = ["templates", "static"]
 ICONS = ["build/icon.ico", "build/icon.icns"]
