@@ -1,74 +1,140 @@
-# Builds the PROTECTED OilStudio (no readable code) on GitHub's own computers:
-#   - Mac, Apple Silicon (M1-M4)
-#   - Mac, Intel
-#   - Windows
-# Run it from the "Actions" tab > "Build OilStudio" > "Run workflow".
-# When it finishes, download the zips under "Artifacts" on the run's page.
-name: Build OilStudio
+# Builds OilStudio for Macs with Apple Silicon (M1 / M2 / M3 / M4) on
+# GitHub's own Apple Silicon Mac - no Mac of your own needed.
+#
+# How to use:
+#   1. Push this file to GitHub (folder .github/workflows/).
+#   2. GitHub > your repo > "Actions" tab > "Build Mac (Apple Silicon)"
+#      > "Run workflow" > pick the edition > "Run workflow".
+#   3. When the run is green (about 10-20 min), open it and download
+#      "OilStudio-mac-apple-silicon" under "Artifacts". Inside: a .zip and a .dmg.
+#
+# Editions:
+#   protected - for clients: no readable code inside (build/protect.py)
+#   plain     - straight from the source (faster, for your own testing)
+name: Build Mac (Apple Silicon)
 
 on:
-  workflow_dispatch:          # the "Run workflow" button
-  push:
-    tags: ["v*"]              # or push a tag like v1.2 to build that version
+  workflow_dispatch:
+    inputs:
+      edition:
+        description: "Which app to build"
+        type: choice
+        options: [protected, plain]
+        default: protected
 
 jobs:
-  build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Mac (Apple Silicon)
-            os: macos-15
-            artifact: OilStudio-mac-apple-silicon
-          - name: Mac (Intel)
-            os: macos-15-intel
-            artifact: OilStudio-mac-intel
-          - name: Windows
-            os: windows-latest
-            artifact: OilStudio-windows
+  mac-arm64:
+    name: Mac Apple Silicon (${{ inputs.edition }})
+    runs-on: macos-15            # GitHub's Apple Silicon (arm64) Mac
+    timeout-minutes: 60
+    env:
+      ARTIFACT: OilStudio-mac-apple-silicon
+      DIST: ${{ inputs.edition == 'plain' && 'dist' || 'dist-protected' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check this is an Apple Silicon Mac
+        run: |
+          echo "Machine: $(uname -m), macOS $(sw_vers -productVersion)"
+          test "$(uname -m)" = "arm64" || { echo "::error::Not an Apple Silicon runner"; exit 1; }
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          architecture: arm64
+          cache: pip
 
       # Node.js lets protect.py scramble the JavaScript names (terser)
       - uses: actions/setup-node@v4
+        if: inputs.edition == 'protected'
         with:
           node-version: "20"
 
       - name: Install packages
         run: |
+          python -c "import platform; print('Python', platform.python_version(), platform.machine())"
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller cython setuptools rjsmin rcssmin
+          pip install -r requirements.txt pyinstaller
+          if [ "${{ inputs.edition }}" = "protected" ]; then
+            pip install cython setuptools rjsmin rcssmin
+          fi
 
-      - name: Protect (minify, pack, compile to machine code, test)
+      # ---- protected: minify, pack, compile to machine code, smoke-test ----
+      - name: Protect the code
+        if: inputs.edition == 'protected'
         run: python build/protect.py --out .release
 
-      - name: Build the app
+      - name: Build OilStudio.app (protected)
+        if: inputs.edition == 'protected'
         working-directory: .release
         run: pyinstaller --noconfirm --clean --workpath ../.pyi-work-protected --distpath ../dist-protected OilStudio-protected.spec
 
-      - name: Zip (Mac)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p dist-protected/OilStudio-mac
-          ditto dist-protected/OilStudio.app dist-protected/OilStudio-mac/OilStudio.app
-          cp build/CLIENT-README.txt "dist-protected/OilStudio-mac/READ ME.txt"
-          ditto -c -k --keepParent dist-protected/OilStudio-mac "dist-protected/${{ matrix.artifact }}.zip"
+      # ---- plain: from the source as it is --------------------------------
+      - name: Build OilStudio.app (plain)
+        if: inputs.edition == 'plain'
+        run: pyinstaller --noconfirm --clean --workpath .pyi-work --distpath dist OilStudio.spec
 
-      - name: Zip (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Check the app is Apple Silicon (arm64)
         run: |
-          Copy-Item build/CLIENT-README.txt "dist-protected/READ ME.txt"
-          Compress-Archive -Force -Path dist-protected/OilStudio, "dist-protected/READ ME.txt" -DestinationPath "dist-protected/${{ matrix.artifact }}.zip"
+          APP="$DIST/OilStudio.app"
+          test -d "$APP" || { echo "::error::$APP was not made"; exit 1; }
+          echo "Main program: $(lipo -archs "$APP/Contents/MacOS/OilStudio")"
+          lipo -archs "$APP/Contents/MacOS/OilStudio" | grep -q arm64 || { echo "::error::Not built for arm64"; exit 1; }
+          # every compiled library inside must run on arm64 too
+          bad=0
+          while IFS= read -r -d '' f; do
+            if file "$f" | grep -q "Mach-O" && ! lipo -archs "$f" 2>/dev/null | grep -q arm64; then
+              echo "::warning::not arm64: ${f#$APP/}"; bad=1
+            fi
+          done < <(find "$APP" -type f \( -name "*.so" -o -name "*.dylib" \) -print0)
+          if [ $bad = 0 ]; then echo "All libraries are arm64."; fi
+          du -sh "$APP"
+
+      # Apple Silicon refuses to run programs with no signature at all:
+      # sign it "ad hoc" (free, no Apple account). Clients still use
+      # "Open Anyway" the first time (see READ ME), as with any app not from Apple's store.
+      - name: Sign (ad hoc)
+        run: |
+          codesign --force --deep --sign - "$DIST/OilStudio.app"
+          codesign --verify --deep --strict --verbose=2 "$DIST/OilStudio.app"
+
+      - name: Test - start the app and load its page
+        run: |
+          PORT=8765 "$DIST/OilStudio.app/Contents/MacOS/OilStudio" > app.log 2>&1 &
+          PID=$!
+          ok=0
+          for i in $(seq 1 300); do
+            if curl -fs "http://127.0.0.1:8765/" -o page.html; then ok=1; break; fi
+            if ! kill -0 $PID 2>/dev/null; then break; fi
+            sleep 0.3
+          done
+          kill $PID 2>/dev/null || true
+          if [ $ok = 1 ]; then
+            echo "The app started and served its page ($(wc -c < page.html) bytes)."
+          else
+            echo "::error::The app did not start. Its output:"; cat app.log; exit 1
+          fi
+
+      - name: Pack .zip and .dmg
+        run: |
+          OUT="$DIST/$ARTIFACT"
+          rm -rf "$OUT" "$DIST/pack"; mkdir -p "$OUT" "$DIST/pack"
+          ditto "$DIST/OilStudio.app" "$DIST/pack/OilStudio.app"
+          cp build/CLIENT-README.txt "$DIST/pack/READ ME.txt"
+          ln -s /Applications "$DIST/pack/Applications"       # drag-to-install in the .dmg
+          # zip: ditto keeps the app's links and signature
+          ditto -c -k --keepParent "$DIST/pack/OilStudio.app" "$OUT/OilStudio-mac-apple-silicon.zip"
+          hdiutil create -volname "OilStudio" -srcfolder "$DIST/pack" -ov -format UDZO \
+            "$OUT/OilStudio-mac-apple-silicon.dmg"
+          cp build/CLIENT-README.txt "$OUT/READ ME.txt"
+          ls -lh "$OUT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: dist-protected/${{ matrix.artifact }}.zip
+          name: ${{ env.ARTIFACT }}-${{ inputs.edition }}
+          path: ${{ env.DIST }}/${{ env.ARTIFACT }}/
           retention-days: 30
+
+      - name: Show the app's log if something failed
+        if: failure()
+        run: cat app.log 2>/dev/null || true
