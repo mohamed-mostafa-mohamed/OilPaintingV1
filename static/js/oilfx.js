@@ -1690,7 +1690,7 @@
     const W = this.w, H = this.h, s = Math.max(W, H) / look.ref_side;
     const f = (k, d) => Number(p[k] ?? d) / 100;
     const st = { patch: f('co_patch', 45), detail: f('co_detail', 55), drag: f('co_drag', 40), dabs: f('co_dabs', 55),
-      relief: f('co_relief', 45), canvas: f('co_canvas', 45), scratch: f('co_scratches', 20), speck: f('co_speckles', 40),
+      relief: f('co_relief', 45), canvas: f('co_canvas', 45), scratch: f('co_scratches', 20), speck: 0,     /* speckles (coloured dots): taken out */
       brush: f('co_brush', 70), size: f('co_stroke_size', 45), loose: f('co_loose', 55), sketch: f('co_sketch', 45),
       contrast: f('co_contrast', 35), vib: f('co_vibrance', 40) };
     const K = (Math.trunc(Number(p.co_seed ?? 7)) % 100000) * 101;
@@ -1953,6 +1953,763 @@
     }
     return { look: cache.look[style], assets: cache.assets[style] };
   }
+  /* ==================================================================
+     Brush Strokes planner on the graphics card - the same steps as
+     oilpaint/brushplan.py (keep the two in step). Every random number is
+     a hash of the stroke's grid cell, so the CPU and the GPU plan the same
+     strokes.  planBrush(src, p) returns the plan the painter in live.js
+     takes (the format of planner.encode / parsePlan).
+     ================================================================== */
+  const BP_HASH = `
+  uint hh(uint x){ x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u; x *= 0x846ca68bu; x ^= x >> 16u; return x; }
+  float rndi(int i, int j, int k){ uint v = hh((uint(i) * 0x8da6b343u) ^ hh((uint(j) * 0xd8163841u) ^ hh(uint(k))));
+    return float(v >> 8u) * (1. / 16777216.); }
+  float nrm(int i, int j, int k){ float u1 = max(rndi(i, j, k), 1e-7), u2 = rndi(i, j, k + 1);
+    return sqrt(-2. * log(u1)) * cos(6.2831853 * u2); }
+  `;
+  /* several outputs (no "out vec4 o") */
+  const HEADM = `#version 300 es
+  precision highp float; precision highp int; uniform ivec2 uDim;
+  ` + BP_HASH;
+  Object.assign(FS, {
+    bpPoster: HEAD + `uniform sampler2D uIn; uniform float uLv, uMix;
+    void main(){ vec3 x = texelFetch(uIn, ivec2(gl_FragCoord.xy), 0).rgb; vec3 q = floor(x * uLv + .5) / uLv;
+      o = vec4(clamp(x + (q - x) * uMix, 0., 1.), 1.); }`,
+    bpSqDiff: HEAD + `uniform sampler2D uA; uniform sampler2D uB;
+    void main(){ ivec2 p = ivec2(gl_FragCoord.xy); vec3 d = texelFetch(uA, p, 0).rgb - texelFetch(uB, p, 0).rgb; o = vec4(d * d, 1.); }`,
+    bpGA: HEAD + `uniform sampler2D uV; uniform float uEps;
+    void main(){ vec3 v = texelFetch(uV, ivec2(gl_FragCoord.xy), 0).rgb; o = vec4(v / (v + uEps), 1.); }`,
+    bpGm: HEAD + `uniform sampler2D uIn; void main(){ vec4 t = texelFetch(uIn, ivec2(gl_FragCoord.xy), 0); o = vec4(sqrt(t.r + t.g)); }`,
+    /* structure tensor -> along-the-edge direction, coherence, weight of the local direction */
+    bpEig: HEAD + `uniform sampler2D uT; uniform sampler2D uG; uniform float uGd;
+    void main(){ ivec2 p = ivec2(gl_FragCoord.xy); vec3 t = texelFetch(uT, p, 0).rgb;
+      float j11 = t.r, j22 = t.g, j12 = t.b; float tmp = sqrt(max((j11 - j22) * (j11 - j22) + 4. * j12 * j12, 0.));
+      float l1 = .5 * (j11 + j22 + tmp), l2 = .5 * (j11 + j22 - tmp); float coh = (l1 - l2) / (l1 + l2 + 1e-9);
+      float ex = j12, ey = l1 - j11; float n = sqrt(ex * ex + ey * ey);
+      vec2 d = n < 1e-12 ? vec2(1., 0.) : vec2(-ey, ex) / max(n, 1e-12);
+      float g = clamp(texelFetch(uG, p, 0).r / uGd, 0., 1.);
+      o = vec4(d, coh, clamp(coh * 2.4, 0., 1.) * clamp(g * 3.2, 0., 1.)); }`,
+    bpAbs: HEAD + `uniform sampler2D uA; uniform sampler2D uB;
+    void main(){ ivec2 p = ivec2(gl_FragCoord.xy); o = vec4(abs(texelFetch(uA, p, 0).r - texelFetch(uB, p, 0).r)); }`,
+    bpNorm: HEAD + `uniform sampler2D uIn; uniform float uD; void main(){ o = vec4(clamp(texelFetch(uIn, ivec2(gl_FragCoord.xy), 0).r / uD, 0., 1.)); }`,
+    /* (grad, busy, open, coherence) */
+    bpPack: HEAD + `uniform sampler2D uG; uniform float uGd; uniform sampler2D uTx; uniform sampler2D uOp; uniform sampler2D uE;
+    void main(){ ivec2 p = ivec2(gl_FragCoord.xy);
+      o = vec4(clamp(texelFetch(uG, p, 0).r / uGd, 0., 1.), texelFetch(uTx, p, 0).r, texelFetch(uOp, p, 0).r, texelFetch(uE, p, 0).b); }`,
+    bpDirs: HEAD + `uniform sampler2D uE; uniform sampler2D uGu; uniform int uHasG; uniform float uK; uniform vec2 uGv;
+    void main(){ ivec2 p = ivec2(gl_FragCoord.xy); vec4 e = texelFetch(uE, p, 0);
+      float wl = (1. - uK) * e.a; vec2 d = e.xy * (dot(e.xy, uGv) < 0. ? -1. : 1.);
+      vec2 b = d * wl + uGv * (1. - wl);
+      if (uHasG == 1) { vec3 g = texelFetch(uGu, p, 0).rgb; vec2 gv = g.xy / (length(g.xy) + 1e-9); float gw = clamp(g.z * 1.8, 0., 1.);
+        b = b * (1. - gw) + gv * gw; }
+      o = vec4(b / (length(b) + 1e-9), 0., 1.); }`,
+    bpGround: HEAD + `uniform sampler2D uIn; uniform vec3 uC; uniform float uF;
+    void main(){ vec3 g = texelFetch(uIn, ivec2(gl_FragCoord.xy), 0).rgb; o = vec4(uC + (g - uC) * uF * .92, 0.); }`,
+    bpMix: HEAD + `uniform sampler2D uA; uniform sampler2D uB; uniform float uM;
+    void main(){ ivec2 p = ivec2(gl_FragCoord.xy); vec3 a = texelFetch(uA, p, 0).rgb; o = vec4(a + (texelFetch(uB, p, 0).rgb - a) * uM, 1.); }`,
+    bpScore: HEAD + `uniform sampler2D uC; uniform sampler2D uRL; uniform sampler2D uF;
+    void main(){ ivec2 p = ivec2(gl_FragCoord.xy); vec4 f = texelFetch(uF, p, 0);
+      float err = length(texelFetch(uC, p, 0).rgb - texelFetch(uRL, p, 0).rgb) * 255. + 14. * f.g;
+      o = vec4(err * (.40 + 1.80 * f.r)); }`,
+    /* the canvas so far (rgb) and where paint is (a): this layer's strokes leave its reference */
+    bpCanvas: HEAD + `uniform sampler2D uC; uniform sampler2D uRL; uniform sampler2D uCov;
+    void main(){ ivec2 p = ivec2(gl_FragCoord.xy); vec4 c = texelFetch(uC, p, 0);
+      float cov = texture(uCov, gl_FragCoord.xy / vec2(uDim)).r; float a = clamp(cov * .92, 0., 1.);
+      o = vec4(c.rgb + (texelFetch(uRL, p, 0).rgb - c.rgb) * a, max(c.a, cov)); }`,
+    bpAlpha: HEAD + `uniform sampler2D uIn; void main(){ o = vec4(texelFetch(uIn, ivec2(gl_FragCoord.xy), 0).a); }`,
+    /* colours of a texture at integer points (one point per texel of uPts) */
+    bpSample: HEAD + `uniform sampler2D uPts; uniform sampler2D uSrc; uniform ivec2 uP;
+    void main(){ vec2 q = texelFetch(uPts, ivec2(gl_FragCoord.xy), 0).xy;
+      ivec2 c = clamp(ivec2(q), ivec2(0), uP - 1); o = texelFetch(uSrc, c, 0); }`,
+    /* one seed per grid cell: where, whether, and the stroke's numbers */
+    bpCells: HEADM + `layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1; layout(location = 2) out vec4 o2;
+    uniform sampler2D uScore; uniform sampler2D uF; uniform sampler2D uRL; uniform sampler2D uRS;
+    uniform ivec2 uP; uniform float uGrid; uniform int uKL; uniform int uLi; uniform float uKeep, uThr; uniform int uHalf;
+    uniform float uRadius, uLen, uMinFrac, uWideBg, uSmall, uStep;
+    void main(){ ivec2 c = ivec2(gl_FragCoord.xy); int ci = c.x, cj = c.y;
+      float fx = (float(ci) + .5) * uGrid + (rndi(ci, cj, uKL + 1) * 2. - 1.) * .45 * uGrid;
+      float fy = (float(cj) + .5) * uGrid + (rndi(ci, cj, uKL + 2) * 2. - 1.) * .45 * uGrid;
+      int ix = int(clamp(fx, 0., float(uP.x - 1))), iy = int(clamp(fy, 0., float(uP.y - 1)));
+      bool keep;
+      if (uLi == 0) keep = rndi(ci, cj, uKL + 4) <= uKeep;
+      else {
+        float sum = 0., n = 0., best = -1e30; int bx = ix, by = iy;
+        for (int dy = -uHalf; dy <= uHalf; dy++) for (int dx = -uHalf; dx <= uHalf; dx++) {
+          ivec2 q = ivec2(ix + dx, iy + dy);
+          if (q.x < 0 || q.y < 0 || q.x >= uP.x || q.y >= uP.y) continue;
+          float s = texelFetch(uScore, q, 0).r; sum += s; n += 1.;
+          if (s > best) { best = s; bx = q.x; by = q.y; } }
+        keep = n > 0. && sum / n >= uThr; ix = bx; iy = by;
+      }
+      vec4 f = texelFetch(uF, ivec2(ix, iy), 0); float g = f.r, tx = f.g, op = f.b;
+      float shrink = .55 + .45 * pow(1. - g, .7);
+      float bg = 1. + (uWideBg - 1.) / 9. * 1.85 * pow(1. - op, 1.5);
+      float t = clamp(uRadius * shrink * bg * (1. + (rndi(ci, cj, uKL + 5) * .36 - .16)), 1.3, uSmall * .18);
+      bool sharp = g > .35;
+      vec3 c0 = sharp ? texelFetch(uRS, ivec2(ix, iy), 0).rgb : texelFetch(uRL, ivec2(ix, iy), 0).rgb;
+      float ml = uLen * (.55 + .6 * rndi(ci, cj, uKL + 6));
+      int steps = max(2, int(ml / uStep)); int mins = max(1, int(float(steps) * uMinFrac));
+      o0 = vec4(float(ix), float(iy), rndi(ci, cj, uKL + 3), keep ? 1. : 0.);
+      o1 = vec4(c0, t); o2 = vec4(tx, sharp ? 1. : 0., float(steps), float(mins)); }`,
+    /* tracing: state (pos, last direction) (alive, count, weight) (colour sum) */
+    bpInit: HEADM + `layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1; layout(location = 2) out vec4 o2;
+    uniform sampler2D uS0; uniform sampler2D uS1; uniform sampler2D uS2; uniform sampler2D uRL; uniform sampler2D uRS;
+    uniform sampler2D uB; uniform sampler2D uC; uniform int uFirst; uniform int uAccum; uniform float uS2g;
+    void main(){ ivec2 p = ivec2(gl_FragCoord.xy); vec4 s0 = texelFetch(uS0, p, 0);
+      o0 = vec4(s0.xy, 0., 0.);
+      if (uFirst == 0) { vec4 b = texelFetch(uB, p, 0); o1 = vec4(1., 0., b.z, 0.); o2 = texelFetch(uC, p, 0); return; }
+      if (uAccum == 0) { o1 = vec4(1., 0., 0., 0.); o2 = vec4(0.); return; }
+      vec3 c0 = texelFetch(uS1, p, 0).rgb; bool sharp = texelFetch(uS2, p, 0).z > .5; ivec2 q = ivec2(s0.xy);
+      vec3 c = sharp ? texelFetch(uRS, q, 0).rgb : texelFetch(uRL, q, 0).rgb;
+      vec3 d = c - c0; float w = exp(-dot(d, d) / uS2g) + 1e-4;
+      o1 = vec4(1., 0., w, 0.); o2 = vec4(c * w, 0.); }`,
+    bpTrace: HEADM + `layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1; layout(location = 2) out vec4 o2;
+    layout(location = 3) out vec4 q0; layout(location = 4) out vec4 q1; layout(location = 5) out vec4 q2;
+    layout(location = 6) out vec4 q3; layout(location = 7) out vec4 q4;
+    uniform sampler2D uS0; uniform sampler2D uS1; uniform sampler2D uS2; uniform sampler2D uA; uniform sampler2D uB; uniform sampler2D uC;
+    uniform sampler2D uD; uniform sampler2D uRef; uniform sampler2D uRS; uniform sampler2D uF;
+    uniform ivec2 uP; uniform float uSign; uniform int uSb, uS0i, uNP, uKey, uAccum, uUseEdge;
+    uniform float uStep, uTol2, uInertia, uEdge, uS2g;
+    void main(){ ivec2 p = ivec2(gl_FragCoord.xy);
+      vec4 s0 = texelFetch(uS0, p, 0), s1 = texelFetch(uS1, p, 0), s2 = texelFetch(uS2, p, 0);
+      vec4 A = texelFetch(uA, p, 0), B = texelFetch(uB, p, 0), Cc = texelFetch(uC, p, 0);
+      int ci = int(s0.z), cj = int(s0.w); vec3 c0 = s1.rgb; float wob = s1.a;
+      int steps = int(s2.x), mins = int(s2.y); bool sharp = s2.z > .5;
+      vec2 x = A.xy, pd = A.zw; bool alive = B.x > .5; float cnt = B.y, ws = B.z; vec3 acc = Cc.rgb;
+      vec2 P[10]; for (int k = 0; k < 10; k++) P[k] = vec2(-1e9);
+      float fc = 1. - uInertia;
+      for (int k = 0; k < 10; k++) {
+        if (k >= uNP) break;
+        int s = uS0i + k;
+        if (!alive || s >= steps) { alive = false; break; }
+        ivec2 xi = ivec2(x);
+        if (xi.x < 1 || xi.y < 1 || xi.x >= uP.x - 1 || xi.y >= uP.y - 1) { alive = false; break; }
+        vec2 d = texelFetch(uD, xi, 0).xy * uSign;
+        if (s > 0) {
+          if (dot(d, pd) < 0.) d = -d;
+          d = fc * d + uInertia * pd; float nn = length(d);
+          if (nn < 1e-6) { alive = false; break; }
+          d /= max(nn, 1e-6);
+        }
+        if (wob > .001) { float a = nrm(ci, cj * 128 + s * 2 + uSb, uKey) * (.20 * wob);
+          float ca = cos(a), sa = sin(a); d = vec2(d.x * ca - d.y * sa, d.x * sa + d.y * ca); }
+        pd = d; x += d * uStep;
+        ivec2 xn = ivec2(x);
+        bool ok = x.x >= 0. && x.y >= 0. && xn.x < uP.x && xn.y < uP.y;
+        ivec2 xc = clamp(xn, ivec2(0), uP - 1);
+        vec3 c = texelFetch(uRef, xc, 0).rgb; vec3 dd = c - c0;
+        if (s >= mins && dot(dd, dd) > uTol2) ok = false;
+        if (uUseEdge == 1 && s >= mins + 1) { vec4 f = texelFetch(uF, xc, 0); if (f.r > uEdge && f.a < .45) ok = false; }
+        if (!ok) { alive = false; break; }
+        P[k] = x; cnt += 1.;
+        if (uAccum == 1) { vec3 cc = sharp ? texelFetch(uRS, xc, 0).rgb : c; vec3 e = cc - c0;
+          float w = exp(-dot(e, e) / uS2g) + 1e-4; acc += cc * w; ws += w; }
+      }
+      o0 = vec4(x, pd); o1 = vec4(alive ? 1. : 0., cnt, ws, 0.); o2 = vec4(acc, 0.);
+      q0 = vec4(P[0], P[1]); q1 = vec4(P[2], P[3]); q2 = vec4(P[4], P[5]); q3 = vec4(P[6], P[7]); q4 = vec4(P[8], P[9]); }`
+  });
+  /* round-ended bands along segments (strokes' footprints, guiding lines):
+     segment i = texel i of uSeg (ax, ay, bx, by) and uSegW (half width,
+     value r g b); later segments over earlier ones */
+  const BP_CAP_VS = `#version 300 es
+  precision highp float; precision highp int;
+  uniform sampler2D uSeg; uniform sampler2D uSegW; uniform vec2 uView; uniform int uTW; uniform float uK; uniform float uOff;
+  out vec2 vA; out vec2 vB; out float vR; out vec3 vV; out vec2 vP;
+  void main(){ int i = gl_InstanceID; ivec2 t = ivec2(i % uTW, i / uTW);
+    vec4 s = texelFetch(uSeg, t, 0) * uK + uOff; vec4 w = texelFetch(uSegW, t, 0);
+    vA = s.xy; vB = s.zw; vR = w.x; vV = w.yzw;
+    vec2 d = vB - vA; float l = length(d); vec2 u = l > 1e-6 ? d / l : vec2(1., 0.); vec2 n = vec2(-u.y, u.x);
+    float e = vR + 1.5; int k = gl_VertexID;
+    vec2 c = (k == 0 || k == 3) ? vA - u * e - n * e : (k == 1) ? vB + u * e - n * e : (k == 2 || k == 4) ? vB + u * e + n * e : vA - u * e + n * e;
+    vP = c; gl_Position = vec4(c / uView * 2. - 1., 0., 1.); }`;
+  const BP_CAP_FS = `#version 300 es
+  precision highp float;
+  in vec2 vA; in vec2 vB; in float vR; in vec3 vV; in vec2 vP; out vec4 o;
+  void main(){ vec2 p = gl_FragCoord.xy; vec2 d = vB - vA; float ll = dot(d, d);
+    float t = ll > 0. ? clamp(dot(p - vA, d) / ll, 0., 1.) : 0.; vec2 q = vA + t * d - p;
+    if (dot(q, q) > vR * vR) discard; o = vec4(vV, 1.); }`;
+
+  const BP_TW = 512;                       /* seeds per texture row */
+  /* cv2's thick lines (the CPU's footprint) cover a little more than their
+     width - more for odd widths (measured) */
+  const footPad = w => w === 1 ? 0 : (w % 2 ? 0.78 : 0.3);
+  const BP_SIGMA = 26 / 255;
+  const lerpB = (a, b, t) => a + (b - a) * t;
+  const clampB = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+  /* the CPU's hash (canvas_oil._rnd) in JavaScript */
+  const hhJ = x => { x >>>= 0; x ^= x >>> 16; x = Math.imul(x, 0x7feb352d) >>> 0; x ^= x >>> 15; x = Math.imul(x, 0x846ca68b) >>> 0; x ^= x >>> 16; return x >>> 0; };
+  const rndJ = (i, j, k) => (hhJ((Math.imul(i >>> 0, 0x8da6b343) >>> 0) ^ hhJ((Math.imul(j >>> 0, 0xd8163841) >>> 0) ^ hhJ(k >>> 0))) >>> 8) / 16777216;
+  const nrmJ = (i, j, k) => { const u1 = Math.max(Math.fround(rndJ(i, j, k)), 1e-7), u2 = rndJ(i, j, k + 1);
+    return Math.fround(Math.sqrt(-2 * Math.log(u1)) * Math.cos(6.2831853 * u2)); };
+  function bpLayout(p, h, w) {
+    const small = Math.min(h, w);
+    const base_t = clampB(2 + (+p.stroke_thickness) / 100 * small * 0.095, 2.4, small * 0.13);
+    const expr = +p.expression;
+    const radii = [base_t, base_t * 0.58, base_t * 0.34, base_t * 0.22].map(r => Math.max(2.6, r));
+    const dedup = [];
+    for (const r of radii) if (!dedup.length || dedup[dedup.length - 1] - r > 0.45) dedup.push(r);
+    return { small, base_t, max_len: base_t * (1.4 + (+p.max_stroke_length) / 100 * 9),
+      min_len_frac: (+p.min_stroke_length) / 100, filling: (+p.filling) / 100, wide_bg: +p.wide_bg_strokes,
+      wobble: expr / 100, col_jit: 2 + expr * 0.30, tol: 12 + expr * 0.52, edge_stop: lerpB(0.55, 1.12, expr / 100),
+      radii: dedup };
+  }
+  const edgeBase = (p, h, w) => 2 + (+p.edge_thickness) / 100 * Math.min(h, w) * 0.10;
+  const bpHex = s => { s = String(s || '#f3ece0').replace('#', ''); return [0, 2, 4].map(i => parseInt(s.slice(i, i + 2), 16) / 255); };
+
+  Object.assign(OilFX.prototype, {
+    _bpTarget(w, h, fmt) {
+      const gl = this.gl, f = fmt === 32 ? [gl.RGBA32F, gl.FLOAT] : [gl.RGBA16F, gl.HALF_FLOAT];
+      /* a float32 texture with LINEAR filtering is incomplete (reads give
+         0,0,0,1) unless the card offers float-linear filtering */
+      if (this.f32lin === undefined) this.f32lin = !!gl.getExtension('OES_texture_float_linear');
+      const tex = this._tex(w, h, f[0], gl.RGBA, f[1], null, fmt === 32 && !this.f32lin ? gl.NEAREST : gl.LINEAR);
+      const fbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      const t = { tex, fbo, w, h, bytes: w * h * (fmt === 32 ? 16 : 8) };
+      (this.bpMade = this.bpMade || []).push(t);
+      return t;
+    },
+    _bpFree(list) {
+      const gl = this.gl;
+      for (const t of list) { if (t.fbo) gl.deleteFramebuffer(t.fbo); if (t.tex) gl.deleteTexture(t.tex); }
+    },
+    /* a framebuffer writing to several textures at once */
+    _bpMRT(ts) {
+      const gl = this.gl, fbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      ts.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t.tex, 0));
+      gl.drawBuffers(ts.map((t, i) => gl.COLOR_ATTACHMENT0 + i));
+      return { fbo, ts };
+    },
+    _bpRead(t, w, h) {
+      const gl = this.gl, buf = new Float32Array(w * h * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+      if (t.ts) gl.readBuffer(gl.COLOR_ATTACHMENT0);
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, buf);
+      return buf;
+    },
+    _bpReadMRT(m, i, w, h) {
+      const gl = this.gl, buf = new Float32Array(w * h * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, m.fbo);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0 + i);
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, buf);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0);
+      return buf;
+    },
+    /* data -> RGBA32F texture (w x h) */
+    _bpData(w, h, data) {
+      const gl = this.gl, t = this._tex(w, h, gl.RGBA32F, gl.RGBA, gl.FLOAT, data);
+      (this.bpData = this.bpData || []).push(t);
+      return t;
+    },
+    async _bpBox(src, dst, tmp, r) {
+      await this._pass('box', tmp, { uIn: src, uDir: [1, 0, 'i'], uR: { i: r } });
+      await this._pass('box', dst, { uIn: tmp.tex, uDir: [0, 1, 'i'], uR: { i: r } });
+    },
+    async _bpGauss(src, dst, tmp, sigma) {
+      if (sigma <= 0.05) { await this._pass('out', dst, { uIn: src }); return; }
+      await this._blur(src, dst, tmp, sigma);
+    },
+    /* canvas_oil.wide: a wide blur made on a copy shrunk by a whole factor */
+    async _bpWide(src, dst, sigma) {
+      const W = this.w, H = this.h, f = Math.floor(sigma / 4);
+      if (f < 2) { const t = this._bpTarget(W, H); await this._bpGauss(src, dst, t, sigma); return; }
+      const sw = Math.max(1, Math.floor(W / f)), sh = Math.max(1, Math.floor(H / f));
+      const S1 = this._bpTarget(sw, sh), S2 = this._bpTarget(sw, sh), S3 = this._bpTarget(sw, sh);
+      await this._at(sw, sh, async () => {
+        await this._pass('down', S1, { uIn: src, uF: [W / sw, H / sh], uSrc: [W, H, 'i'] });
+        await this._bpGauss(S1.tex, S2, S3, sigma / f);
+      });
+      await this._pass('up', dst, { uIn: S2.tex });
+    },
+    /* brushplan.guided: self-guided filter with its coefficients found small */
+    async _bpGuided(src, dst, r, eps) {
+      const W = this.w, H = this.h, f = Math.max(1, Math.floor(r / 4));
+      const sw = f > 1 ? Math.max(1, Math.floor(W / f)) : W, sh = f > 1 ? Math.max(1, Math.floor(H / f)) : H;
+      const rs = Math.max(1, Math.round(r / f));
+      const T = () => this._bpTarget(sw, sh);
+      const small = f > 1 ? T() : null, m = T(), mm = T(), sq = T(), a = T(), b = T(), ma = T(), mb = T(), tmp = T();
+      await this._at(sw, sh, async () => {
+        if (small) await this._pass('down', small, { uIn: src, uF: [W / sw, H / sh], uSrc: [W, H, 'i'] });
+        const s = small ? small.tex : src;
+        await this._bpBox(s, m, tmp, rs);
+        await this._pass('bpSqDiff', sq, { uA: s, uB: m.tex });
+        await this._bpBox(sq.tex, mm, tmp, rs);
+        await this._pass('bpGA', a, { uV: mm.tex, uEps: eps });
+        await this._pass('guidedB', b, { uM: m.tex, uA: a.tex });
+        await this._bpBox(a.tex, ma, tmp, rs);
+        await this._bpBox(b.tex, mb, tmp, rs);
+      });
+      let A = ma, B = mb;
+      if (f > 1) { A = this._bpTarget(W, H); B = this._bpTarget(W, H);
+        await this._pass('up', A, { uIn: ma.tex }); await this._pass('up', B, { uIn: mb.tex }); }
+      await this._pass('guidedOut', dst, { uIn: src, uA: A.tex, uB: B.tex });
+    },
+    async _bpSimplify(src, dst, simp, boost) {
+      const W = this.w, H = this.h, s = simp * boost;
+      const scale = clampB(Math.max(W, H) / 900, 0.55, 1.8);
+      const r = Math.max(1, Math.round(clampB(2 + s * 2.2, 2, 34) * scale * 0.25));
+      const eps = clampB(0.05 + s * 0.017, 0.04, 0.42) ** 2 * 0.05;
+      const t1 = this._bpTarget(W, H), t2 = this._bpTarget(W, H);
+      await this._bpGuided(src, t1, r, eps);
+      await this._bpGuided(t1.tex, t2, r, eps);
+      /* kept in 0..1 (the filter overshoots at edges), posterised for the strongest settings */
+      await this._pass('bpPoster', dst, { uIn: t2.tex, uLv: clampB(34 - s, 19, 26), uMix: s >= 9.5 ? clampB((s - 9.5) / 5.5, 0, 1) : 0 });
+    },
+    /* round-ended bands, drawn into target t (size vw x vh) */
+    _bpCapsules(t, vw, vh, segs, wv, n, k, off, clear) {
+      const gl = this.gl;
+      if (!this.bpCap) this.bpCap = this._program(BP_CAP_VS, BP_CAP_FS);
+      const pr = this.bpCap, rows = Math.max(1, Math.ceil(n / BP_TW));
+      gl.disable(gl.BLEND);
+      const pad = a => { const out = new Float32Array(BP_TW * rows * 4); out.set(a.subarray(0, Math.min(a.length, n * 4))); return out; };
+      const tS = this._bpData(BP_TW, rows, pad(segs)), tW = this._bpData(BP_TW, rows, pad(wv));
+      gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+      gl.viewport(0, 0, vw, vh);
+      if (clear) { gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
+      gl.useProgram(pr.p);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tS); gl.uniform1i(pr.u.uSeg, 0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tW); gl.uniform1i(pr.u.uSegW, 1);
+      gl.uniform2f(pr.u.uView, vw, vh); gl.uniform1i(pr.u.uTW, BP_TW); gl.uniform1f(pr.u.uK, k); gl.uniform1f(pr.u.uOff, off);
+      gl.bindVertexArray(this.vao);
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, n);
+    },
+    /* the photo analysis, kept between plans of the same picture */
+    async _bpAnalyse(srcTex, p, key) {
+      const W = this.w, H = this.h, small = Math.min(W, H);
+      const simp = +p.simplicity;
+      const keep = this.bpKeep || (this.bpKeep = {});
+      const kRefs = JSON.stringify([key, W, H, simp]);
+      if (keep.kRefs !== kRefs) {
+        if (keep.refs) this._bpFree(keep.refs.all);
+        keep.kDirs = null;
+        const made = this.bpMade = [];
+        const ref = this._bpTarget(W, H), fine = this._bpTarget(W, H);
+        await this._bpSimplify(srcTex, ref, simp, 1);
+        await this._bpSimplify(srcTex, fine, simp, 0.45);
+        const gray = this._bpTarget(W, H), g = this._bpTarget(W, H), tmp = this._bpTarget(W, H);
+        await this._pass('luma', gray, { uIn: fine.tex });
+        await this._bpGauss(gray.tex, g, tmp, 1.2);
+        const T = this._bpTarget(W, H, 32), gm0 = this._bpTarget(W, H), gm = this._bpTarget(W, H);
+        await this._pass('tensor', T, { uIn: g.tex });
+        await this._pass('bpGm', gm0, { uIn: T.tex });
+        await this._bpGauss(gm0.tex, gm, tmp, 2.0);
+        const gd = (await this._pct(gm.tex, W, H, 86)) + 1e-6;
+        const Tb = this._bpTarget(W, H, 32);
+        await this._bpWide(T.tex, Tb, Math.max(1.5, small / 90));
+        const E = this._bpTarget(W, H);              /* half floats: the kept stages stay small */
+        await this._pass('bpEig', E, { uT: Tb.tex, uG: gm.tex, uGd: gd });
+        const bg = this._bpTarget(W, H), ad = this._bpTarget(W, H), tx0 = this._bpTarget(W, H), tx = this._bpTarget(W, H);
+        await this._bpWide(gray.tex, bg, Math.max(2, small / 160));
+        await this._pass('bpAbs', ad, { uA: gray.tex, uB: bg.tex });
+        await this._bpGauss(ad.tex, tx0, tmp, 6.0);
+        await this._pass('bpNorm', tx, { uIn: tx0.tex, uD: (await this._pct(tx0.tex, W, H, 92)) + 1e-6 });
+        const gr = this._bpTarget(W, H), op0 = this._bpTarget(W, H), op = this._bpTarget(W, H);
+        await this._pass('bpNorm', gr, { uIn: gm.tex, uD: gd });
+        await this._bpWide(gr.tex, op0, Math.max(4, small / 26));
+        await this._pass('bpNorm', op, { uIn: op0.tex, uD: (await this._pct(op0.tex, W, H, 92)) + 1e-6 });
+        const F = this._bpTarget(W, H);
+        await this._pass('bpPack', F, { uG: gm.tex, uGd: gd, uTx: tx.tex, uOp: op.tex, uE: E.tex });
+        /* keep what the layers need, let the rest go */
+        const kept = [ref, fine, E, F];
+        this._bpFree(made.filter(t => !kept.includes(t)));
+        keep.refs = { ref, fine, E, F, all: kept };
+        keep.kRefs = kRefs;
+        this.bpMade = [];
+      }
+      const guides = (p.guides || []).filter(l => l && l.length >= 2);
+      const kDirs = JSON.stringify([kRefs, +p.direction, +p.global_angle, guides]);
+      if (keep.kDirs !== kDirs) {
+        if (keep.dirs) this._bpFree([keep.dirs]);
+        this.bpMade = [];
+        const D = this._bpTarget(W, H);
+        const ang = (+p.global_angle) * Math.PI / 180;
+        let G = null;
+        if (guides.length) {
+          const segs = [], wv = [], radius = Math.max(6, Math.floor(small * 0.05));
+          for (const line of guides) {
+            const pts = line.map(([x, y]) => [x * (W - 1), y * (H - 1)]);
+            for (let i = 0; i + 1 < pts.length; i++) {
+              const [ax, ay] = pts[i], [bx, by] = pts[i + 1], l = Math.hypot(bx - ax, by - ay);
+              if (l < 1e-3) continue;
+              segs.push(ax, ay, bx, by); wv.push(radius * 0.5, (bx - ax) / l, (by - ay) / l, 1);
+            }
+          }
+          if (segs.length) {
+            const raw = this._bpTarget(W, H); G = this._bpTarget(W, H);
+            this._bpCapsules(raw, W, H, new Float32Array(segs), new Float32Array(wv), segs.length / 4, 1, 0, true);
+            await this._bpWide(raw.tex, G, radius * 0.9);
+          }
+        }
+        await this._pass('bpDirs', D, { uE: keep.refs.E.tex, uGu: G ? G.tex : keep.refs.E.tex, uHasG: { i: G ? 1 : 0 },
+          uK: (+p.direction) / 100, uGv: [Math.cos(ang), Math.sin(ang)] });
+        this._bpFree(this.bpMade.filter(t => t !== D));
+        this.bpMade = [];
+        keep.dirs = D; keep.kDirs = kDirs;
+      }
+      return { ...keep.refs, D: keep.dirs };
+    },
+    /* seeds -> paths (both ways), counts and colours. sd: arrays per stroke */
+    async _bpTrace(an, n, sd, L) {
+      const gl = this.gl, W = this.w, H = this.h;
+      if (!n) return { paths: [], colours: new Float32Array(0) };
+      const TW = BP_TW, TH = Math.ceil(n / TW), N4 = TW * TH * 4;
+      const S0 = new Float32Array(N4), S1 = new Float32Array(N4), S2 = new Float32Array(N4);
+      let smax = 0;
+      for (let i = 0; i < n; i++) {
+        S0.set([sd.x[i], sd.y[i], sd.ci[i], sd.cj[i]], i * 4);
+        S1.set([sd.c0[i * 3], sd.c0[i * 3 + 1], sd.c0[i * 3 + 2], sd.wob[i]], i * 4);
+        S2.set([sd.steps[i], sd.mins[i], sd.sharp ? sd.sharp[i] : 0, 0], i * 4);
+        if (sd.steps[i] > smax) smax = sd.steps[i];
+      }
+      const t0 = this._bpData(TW, TH, S0), t1 = this._bpData(TW, TH, S1), t2 = this._bpData(TW, TH, S2);
+      const st = () => [this._bpTarget(TW, TH, 32), this._bpTarget(TW, TH, 32), this._bpTarget(TW, TH, 32)];
+      let cur = st(), nxt = st();
+      const maxDB = gl.getParameter(gl.MAX_DRAW_BUFFERS), PA = Math.min(5, maxDB - 3);
+      if (PA < 1) throw new Error('This graphics card cannot plan brush strokes (too few draw buffers).');
+      const NP = PA * 2;
+      const pts = [this._bpTarget(TW, TH, 32), this._bpTarget(TW, TH, 32), this._bpTarget(TW, TH, 32),
+        this._bpTarget(TW, TH, 32), this._bpTarget(TW, TH, 32)].slice(0, PA);
+      const runs = [[], []];                       /* per sign: list of Float32Array chunks of points */
+      const uni = { uS0: t0, uS1: t1, uS2: t2, uD: an.D.tex, uRef: L.ref, uRS: L.rs || L.ref, uF: an.F.tex,
+        uP: [W, H, 'i'], uStep: L.step, uTol2: L.tol * L.tol, uInertia: L.inertia, uEdge: L.edge == null ? 0 : L.edge,
+        uUseEdge: { i: L.edge == null ? 0 : 1 }, uKey: { i: L.key }, uAccum: { i: L.accum ? 1 : 0 }, uS2g: 2 * BP_SIGMA * BP_SIGMA };
+      let finalB = null, finalC = null;
+      await this._at(TW, TH, async () => {
+        for (let sb = 0; sb < 2; sb++) {
+          /* start (again) at the seeds; the second run keeps the colour sums */
+          const mi = this._bpMRT(nxt);
+          await this._pass('bpInit', mi, Object.assign({}, uni, { uB: cur[1].tex, uC: cur[2].tex, uRL: L.ref, uRS: L.rs || L.ref,
+            uFirst: { i: sb === 0 ? 1 : 0 } }));
+          gl.deleteFramebuffer(mi.fbo);
+          [cur, nxt] = [nxt, cur];
+          for (let s0 = 0; s0 < smax; s0 += NP) {
+            const m = this._bpMRT(nxt.concat(pts));
+            await this._pass('bpTrace', m, Object.assign({}, uni, { uA: cur[0].tex, uB: cur[1].tex, uC: cur[2].tex,
+              uSign: sb ? -1 : 1, uSb: { i: sb }, uS0i: { i: s0 }, uNP: { i: Math.min(NP, smax - s0) } }));
+            const chunk = [];
+            for (let a = 0; a < PA; a++) chunk.push(this._bpReadMRT(m, 3 + a, TW, TH));
+            runs[sb].push(chunk);
+            gl.deleteFramebuffer(m.fbo);
+            [cur, nxt] = [nxt, cur];
+          }
+        }
+        const mf = this._bpMRT(cur);
+        finalB = this._bpReadMRT(mf, 1, TW, TH); finalC = this._bpReadMRT(mf, 2, TW, TH);
+        gl.deleteFramebuffer(mf.fbo);
+      });
+      /* paths: the backward run reversed, the seed, the forward run */
+      const paths = new Array(n), colours = new Float32Array(n * 3);
+      const runPts = (sb, i) => {
+        const out = [];
+        for (const chunk of runs[sb]) {
+          for (let a = 0; a < chunk.length; a++) {
+            const b = chunk[a];
+            for (let q = 0; q < 2; q++) {
+              const x = b[i * 4 + q * 2], y = b[i * 4 + q * 2 + 1];
+              if (x < -1e8) return out;
+              out.push(x, y);
+            }
+          }
+        }
+        return out;
+      };
+      for (let i = 0; i < n; i++) {
+        const fwd = runPts(0, i), bwd = runPts(1, i);
+        const cp = fwd.length / 2, cn = bwd.length / 2, total = cp + cn + 1;
+        const P = new Float32Array(Math.max(2, total) * 2);
+        if (total < 2) {
+          const a = Math.fround(rndJ(sd.ci[i], sd.cj[i], L.key + 40) * Math.PI), r = L.step * 0.6;
+          P.set([sd.x[i] - Math.cos(a) * r, sd.y[i] - Math.sin(a) * r, sd.x[i] + Math.cos(a) * r, sd.y[i] + Math.sin(a) * r]);
+        } else {
+          let o = 0;
+          for (let k = cn - 1; k >= 0; k--) { P[o++] = bwd[k * 2]; P[o++] = bwd[k * 2 + 1]; }
+          P[o++] = sd.x[i]; P[o++] = sd.y[i];
+          for (let k = 0; k < cp; k++) { P[o++] = fwd[k * 2]; P[o++] = fwd[k * 2 + 1]; }
+        }
+        paths[i] = P;
+        const ws = finalB[i * 4 + 2];
+        for (let c = 0; c < 3; c++)
+          colours[i * 3 + c] = L.accum && total > 2 ? finalC[i * 4 + c] / Math.max(ws, 1e-9) : sd.c0[i * 3 + c];
+      }
+      return { paths, colours };
+    },
+    /* colours of texture tex at integer points xs, ys */
+    async _bpSampleAt(tex, xs, ys) {
+      const n = xs.length; if (!n) return new Float32Array(0);
+      const W = this.w, H = this.h, TW = BP_TW, TH = Math.ceil(n / TW);
+      const d = new Float32Array(TW * TH * 4);
+      for (let i = 0; i < n; i++) { d[i * 4] = xs[i]; d[i * 4 + 1] = ys[i]; }
+      const tp = this._bpData(TW, TH, d), out = this._bpTarget(TW, TH, 32);
+      await this._at(TW, TH, () => this._pass('bpSample', out, { uPts: tp, uSrc: tex, uP: [W, H, 'i'] }));
+      const buf = this._bpRead(out, TW, TH), res = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++) res[i * 3 + c] = buf[i * 4 + c];
+      return res;
+    },
+    /* footprint of these strokes (quarter size, like the CPU's cv2.polylines) */
+    _bpFootprint(cov, sw, sh, paths, widths) {
+      let ns = 0; for (const P of paths) ns += P.length / 2 - 1;
+      const segs = new Float32Array(ns * 4), wv = new Float32Array(ns * 4);
+      let o = 0;
+      paths.forEach((P, i) => {
+        const wd = Math.max(1, Math.round(widths[i] * 0.25)), hw = wd * 0.5 + footPad(wd);
+        for (let k = 0; k + 3 < P.length; k += 2) {
+          segs.set([P[k], P[k + 1], P[k + 2], P[k + 3]], o * 4); wv.set([hw, 1, 1, 1], o * 4); o++;
+        }
+      });
+      this._bpCapsules(cov, sw, sh, segs, wv, ns, 0.25, 0.5, true);
+    },
+    async planBrush(src, p, opts = {}) {
+      if (!this.ok) throw new Error('WebGL 2 is not available');
+      while (this.busy) { try { await this.busy; } catch (e) { /* fine */ } }
+      const job = this._planBrush(src, p, opts);
+      this.busy = job;
+      try { return await job; } finally { if (this.busy === job) this.busy = null; }
+    },
+    async _planBrush(src, p, opts) {
+      const gl = this.gl, T0 = performance.now();
+      const W = src.width, H = src.height;
+      this.w = W; this.h = H; this.stopFn = opts.shouldStop || null;
+      const report = opts.onProgress || (() => {});
+      this.bpData = []; this.bpMade = [];
+      const tSrc = this._img(src);
+      const temp = [];
+      try {
+        report(0.02, 'Reading the photo');
+        const an = await this._bpAnalyse(tSrc, p, opts.key || 'live');
+        this.bpMade = [];
+        const T = (fmt) => this._bpTarget(W, H, fmt);
+        const lay = bpLayout(p, H, W);
+        const K = (Math.trunc(+p.random_seed) % 100000) * 1009;
+        const parts = [];
+        /* ground and the canvas estimate */
+        const gb = T(), ground = T(), canvas = [T(), T()];
+        await this._bpWide(an.ref.tex, gb, Math.max(1.5, lay.base_t * 0.85));
+        await this._pass('bpGround', ground, { uIn: gb.tex, uC: bpHex(p.canvas_color), uF: clampB(lay.filling, 0, 1) });
+        await this._pass('bpGround', canvas[0], { uIn: gb.tex, uC: bpHex(p.canvas_color), uF: clampB(lay.filling, 0, 1) });
+        let ci0 = 0;
+        const sw = Math.max(8, Math.floor(W * 0.25)), sh = Math.max(8, Math.floor(H * 0.25));
+        const cov = this._bpTarget(sw, sh), mix = T(), RL = T(), RS = T(), score = T();
+        const nL = lay.radii.length;
+        for (let li = 0; li < nL; li++) {
+          report(0.1 + 0.7 * li / nL, `Planning layer ${li + 1}/${nL}`);
+          const radius = lay.radii[li], KL = K + 1000 * (li + 1);
+          const m = nL === 1 ? 0 : (li / (nL - 1)) ** 0.85, sig = Math.max(0.7, radius * 0.5);
+          await this._pass('bpMix', mix, { uA: an.ref.tex, uB: an.fine.tex, uM: m });
+          await this._bpWide(mix.tex, RL, sig);
+          await this._bpWide(mix.tex, RS, Math.max(0.5, sig * 0.35));
+          const grid = Math.max(2, radius * (li === 0 ? 1.05 : 0.85));
+          const nx = Math.ceil((W - grid * 0.5) / grid), ny = Math.ceil((H - grid * 0.5) / grid);
+          let thr = 0;
+          if (li > 0) {
+            await this._pass('bpScore', score, { uC: canvas[ci0].tex, uRL: RL.tex, uF: an.F.tex });
+            thr = Math.max(lerpB(70, 24, lay.filling) * (1 + 0.18 * (li - 1)), await this._pct(score.tex, W, H, lerpB(88, 45, lay.filling)));
+          }
+          const layerLen = lay.max_len * (li === 0 ? 1 : lerpB(0.62, 0.28, li / 3));
+          const step = Math.max(1, radius * 0.38);
+          const cA = this._bpTarget(nx, ny, 32), cB = this._bpTarget(nx, ny, 32), cC = this._bpTarget(nx, ny, 32);
+          const mc = this._bpMRT([cA, cB, cC]);
+          await this._at(nx, ny, () => this._pass('bpCells', mc, { uScore: score.tex, uF: an.F.tex, uRL: RL.tex, uRS: RS.tex,
+            uP: [W, H, 'i'], uGrid: grid, uKL: { i: KL }, uLi: { i: li }, uKeep: lerpB(0.42, 1, lay.filling), uThr: thr,
+            uHalf: { i: Math.floor(grid * 0.5) }, uRadius: radius, uLen: layerLen, uMinFrac: lay.min_len_frac,
+            uWideBg: lay.wide_bg, uSmall: lay.small, uStep: step }));
+          const A = this._bpReadMRT(mc, 0, nx, ny), B = this._bpReadMRT(mc, 1, nx, ny), Cc = this._bpReadMRT(mc, 2, nx, ny);
+          gl.deleteFramebuffer(mc.fbo);
+          /* kept cells in the hash order (stable, like numpy's argsort) */
+          const idx = [];
+          for (let c = 0; c < nx * ny; c++) if (A[c * 4 + 3] > 0.5) idx.push(c);
+          idx.sort((a, b) => (A[a * 4 + 2] - A[b * 4 + 2]) || (a - b));
+          const n = idx.length;
+          if (!n) continue;
+          const sd = { x: new Float32Array(n), y: new Float32Array(n), ci: new Int32Array(n), cj: new Int32Array(n),
+            c0: new Float32Array(n * 3), wob: new Float32Array(n), steps: new Int32Array(n), mins: new Int32Array(n),
+            sharp: new Float32Array(n), t: new Float32Array(n), tx: new Float32Array(n) };
+          idx.forEach((c, i) => {
+            sd.x[i] = A[c * 4]; sd.y[i] = A[c * 4 + 1]; sd.ci[i] = c % nx; sd.cj[i] = Math.floor(c / nx);
+            sd.c0.set([B[c * 4], B[c * 4 + 1], B[c * 4 + 2]], i * 3); sd.t[i] = B[c * 4 + 3];
+            sd.tx[i] = Cc[c * 4]; sd.sharp[i] = Cc[c * 4 + 1]; sd.steps[i] = Cc[c * 4 + 2]; sd.mins[i] = Cc[c * 4 + 3];
+            sd.wob[i] = Math.fround(lay.wobble * (0.25 + 0.75 * sd.tx[i]));
+          });
+          const tr = await this._bpTrace(an, n, sd, { ref: RL.tex, rs: RS.tex, step, accum: true,
+            tol: lay.tol * (li === 0 ? 1 : lerpB(0.80, 0.50, li / 3)) / 255, inertia: li === 0 ? 0.74 : 0.62,
+            edge: lay.edge_stop, key: KL + 7 });
+          const last = li === nL - 1;
+          const rows = new Float32Array(n * 20);
+          for (let i = 0; i < n; i++) {
+            const a = sd.ci[i], b = sd.cj[i], r0 = i * 20;
+            const js = lay.col_jit * (0.22 + 0.78 * sd.tx[i]), n0 = nrmJ(a, b, KL + 9);
+            for (let c = 0; c < 3; c++) {
+              rows[r0 + 2 - c] = tr.colours[i * 3 + c] * 255;               /* BGR */
+              rows[r0 + 5 - c] = n0 * js + nrmJ(a, b, KL + 11 + 2 * c) * js * 0.3;
+            }
+            rows[r0 + 6] = sd.t[i]; rows[r0 + 7] = sd.tx[i];
+            rows[r0 + 8] = 0.9 + 0.16 * rndJ(a, b, KL + 17); rows[r0 + 9] = 1 + 0.5 * rndJ(a, b, KL + 18);
+            rows[r0 + 10] = last ? 1 : 0; rows[r0 + 11] = 3;
+            for (let c = 0; c < 6; c++) rows[r0 + 12 + c] = rndJ(a, b, KL + 20 + c);
+            rows[r0 + 18] = rndJ(a, b, KL + 26);
+          }
+          parts.push({ rows, paths: tr.paths });
+          /* the canvas estimate: where this layer's strokes land, its reference */
+          this._bpFootprint(cov, sw, sh, tr.paths, sd.t);
+          await this._pass('bpCanvas', canvas[1 - ci0], { uC: canvas[ci0].tex, uRL: RL.tex, uCov: cov.tex });
+          ci0 = 1 - ci0;
+        }
+        /* filling: small strokes where the canvas is still bare */
+        report(0.85, 'Filling empty spaces');
+        if (lay.filling > 0.02) {
+          const KF = K + 9000, fw = Math.max(1, Math.floor(W / 6)), fh = Math.max(1, Math.floor(H / 6));
+          const ca = T(), fs = this._bpTarget(fw, fh, 32);
+          await this._pass('bpAlpha', ca, { uIn: canvas[ci0].tex });
+          await this._at(fw, fh, () => this._pass('down', fs, { uIn: ca.tex, uF: [W / fw, H / fh], uSrc: [W, H, 'i'] }));
+          const small = this._bpRead(fs, fw, fh), thr = lerpB(0.65, 0.16, lay.filling), frac = lerpB(0.15, 1, lay.filling);
+          const cells = [];
+          for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++)
+            if (small[(y * fw + x) * 4] < thr && rndJ(x, y, KF + 1) < frac) cells.push([x, y, rndJ(x, y, KF + 2), y * fw + x]);
+          cells.sort((a, b) => (a[2] - b[2]) || (a[3] - b[3]));
+          const n = cells.length;
+          if (n) {
+            const r = Math.max(1.6, lay.base_t * 0.42);
+            const RF = T(), tmp = T();
+            await this._bpGauss(an.fine.tex, RF, tmp, Math.max(0.8, r * 0.6));
+            const xs = new Float32Array(n), ys = new Float32Array(n);
+            cells.forEach(([x, y], i) => {
+              xs[i] = clampB(x * 6 + Math.floor(rndJ(x, y, KF + 3) * 6), 0, W - 1);
+              ys[i] = clampB(y * 6 + Math.floor(rndJ(x, y, KF + 4) * 6), 0, H - 1);
+            });
+            const base = await this._bpSampleAt(RF.tex, xs, ys);
+            const step = Math.max(1, r * 0.5), steps = Math.max(2, Math.floor(r * 5 / step)), mins = Math.max(1, Math.floor(steps * 0.3));
+            const sd = { x: xs, y: ys, ci: new Int32Array(n), cj: new Int32Array(n), c0: new Float32Array(n * 3),
+              wob: new Float32Array(n).fill(0.35), steps: new Int32Array(n).fill(steps), mins: new Int32Array(n).fill(mins) };
+            const jit = new Float32Array(n * 3);
+            cells.forEach(([x, y], i) => {
+              sd.ci[i] = x; sd.cj[i] = y;
+              for (let c = 0; c < 3; c++) { jit[i * 3 + c] = nrmJ(x, y, KF + 5 + 2 * c) * lay.col_jit;
+                sd.c0[i * 3 + c] = clampB(base[i * 3 + c] + jit[i * 3 + c] / 255, 0, 1); }
+            });
+            const tr = await this._bpTrace(an, n, sd, { ref: RF.tex, step, accum: false, tol: 40 / 255, inertia: 0.72,
+              edge: null, key: KF + 12 });
+            const rows = new Float32Array(n * 20);
+            cells.forEach(([x, y], i) => {
+              const r0 = i * 20;
+              for (let c = 0; c < 3; c++) { rows[r0 + 2 - c] = base[i * 3 + c] * 255; rows[r0 + 5 - c] = jit[i * 3 + c]; }
+              rows[r0 + 6] = Math.fround(r * (0.85 + 0.55 * rndJ(x, y, KF + 11)));
+              rows[r0 + 7] = 1; rows[r0 + 8] = 1; rows[r0 + 9] = 1; rows[r0 + 10] = 2; rows[r0 + 11] = 3;
+              for (let c = 0; c < 6; c++) rows[r0 + 12 + c] = rndJ(x, y, KF + 20 + c);
+              rows[r0 + 18] = rndJ(x, y, KF + 26);
+            });
+            parts.push({ rows, paths: tr.paths });
+          }
+        }
+        /* the Edge tab's border strokes */
+        if (+p.edge_enabled) {
+          const e = bpEdges(p, H, W, opts.pxScale || 1);
+          const xs = e.mids.map(m => clampB(Math.trunc(m[0]), 0, W - 1)), ys = e.mids.map(m => clampB(Math.trunc(m[1]), 0, H - 1));
+          const col = await this._bpSampleAt(an.fine.tex, xs, ys);
+          const fixed = bpHex(p.edge_color), use = !!+p.edge_use_color, n = e.paths.length;
+          const rows = new Float32Array(n * 20);
+          e.rows.forEach(([t, op, sdv, nz], i) => {
+            const r0 = i * 20;
+            for (let c = 0; c < 3; c++) {
+              rows[r0 + 2 - c] = (use ? fixed[c] : col[i * 3 + c]) * 255;
+              rows[r0 + 5 - c] = nz[c] * (use ? 6 : 10);
+            }
+            rows[r0 + 6] = t; rows[r0 + 7] = 1; rows[r0 + 8] = op; rows[r0 + 9] = 1; rows[r0 + 10] = 3;
+            rows[r0 + 11] = use ? 0 : 1; rows[r0 + 18] = sdv;
+          });
+          parts.push({ rows, paths: e.paths });
+        }
+        /* the plan, in the painter's format */
+        let n = 0, m = 0;
+        for (const q of parts) { n += q.paths.length; for (const P of q.paths) m += P.length / 2; }
+        const strokes = new Float32Array(n * 20), pts = new Float32Array(m * 2), offs = new Uint32Array(n + 1);
+        let si = 0, pi = 0;
+        for (const q of parts) {
+          strokes.set(q.rows, si * 20);
+          for (const P of q.paths) { offs[si] = pi; pts.set(P, pi * 2); pi += P.length / 2; si++; }
+        }
+        offs[n] = pi;
+        /* the ground, small, RGB 0..255 */
+        const gs = Math.min(1, (opts.groundSide || 1200) / Math.max(W, H));
+        const gw = Math.max(1, Math.floor(W * gs)), gh = Math.max(1, Math.floor(H * gs));
+        const gt = this._bpTarget(gw, gh, 32);
+        await this._at(gw, gh, () => this._pass('down', gt, { uIn: ground.tex, uF: [W / gw, H / gh], uSrc: [W, H, 'i'] }));
+        const gbuf = this._bpRead(gt, gw, gh), g8 = new Uint8Array(gw * gh * 3);
+        for (let i = 0; i < gw * gh; i++) for (let c = 0; c < 3; c++) g8[i * 3 + c] = Math.max(0, Math.min(255, Math.round(gbuf[i * 4 + c] * 255)));
+        this.lastPlanMs = Math.round(performance.now() - T0);
+        if (gl.isContextLost()) throw new Error('The graphics card stopped responding');
+        return { w: W, h: H, n, m, strokes, pts, offs, ground: g8, gw, gh, edgeBase: edgeBase(p, H, W),
+          baseT: lay.base_t, ms: this.lastPlanMs };
+      } finally {
+        gl.deleteTexture(tSrc);
+        this._bpFree(this.bpMade || []); this.bpMade = [];
+        for (const t of this.bpData || []) gl.deleteTexture(t);
+        this.bpData = [];
+        this.stopFn = null;
+      }
+    }
+  });
+  /* the Edge tab's strokes (brushplan.edge_strokes) */
+  function bpEdges(p, h, w, pxScale) {
+    const KE = Math.trunc(+p.edge_seed) * 7919 + 77, n = Math.trunc(+p.edge_number) * 4;
+    const small = Math.min(h, w), thick = edgeBase(p, h, w);
+    const length = 6 + (+p.edge_max_length) / 100 * small * 0.32, ell = !!+p.edge_ellipse, walk = 3 * pxScale;
+    const R = (i, k) => rndJ(i, 0, KE + k), N = (i, k) => nrmJ(i, 0, KE + k);
+    const paths = [], mids = [], rows = [];
+    for (let i = 0; i < n; i++) {
+      let x, y, tx, ty;
+      if (ell) {
+        const a = R(i, 1) * 2 * Math.PI, band = 0.86 + 0.2 * R(i, 2);
+        x = w * 0.5 + Math.cos(a) * w * 0.5 * band; y = h * 0.5 + Math.sin(a) * h * 0.5 * band; tx = -Math.sin(a); ty = Math.cos(a);
+      } else {
+        const side = i % 4, band = R(i, 2) * 0.085 * small, u = R(i, 3);
+        if (side === 0) { x = u * w; y = band; tx = 1; ty = 0; }
+        else if (side === 1) { x = u * w; y = h - band; tx = 1; ty = 0; }
+        else if (side === 2) { x = band; y = u * h; tx = 0; ty = 1; }
+        else { x = w - band; y = u * h; tx = 0; ty = 1; }
+      }
+      const a = N(i, 4) * 0.30;
+      [tx, ty] = [tx * Math.cos(a) - ty * Math.sin(a), tx * Math.sin(a) + ty * Math.cos(a)];
+      const ln = length * (0.35 + 0.65 * R(i, 6)), ns = Math.max(2, Math.trunc(ln / walk));
+      let px = x - tx * ln * 0.5, py = y - ty * ln * 0.5;
+      const P = new Float32Array(ns * 2);
+      for (let s = 0; s < ns; s++) {
+        const wb = nrmJ(i, s + 1, KE + 8) * 0.12;
+        [tx, ty] = [tx * Math.cos(wb) - ty * Math.sin(wb), tx * Math.sin(wb) + ty * Math.cos(wb)];
+        px += tx * walk; py += ty * walk; P[s * 2] = px; P[s * 2 + 1] = py;
+      }
+      paths.push(P); mids.push([P[Math.trunc(ns / 2) * 2], P[Math.trunc(ns / 2) * 2 + 1]]);
+      rows.push([thick * (0.6 + 0.65 * R(i, 10)), 0.75 + 0.25 * R(i, 11), R(i, 12), [0, 1, 2].map(c => N(i, 13 + 2 * c))]);
+    }
+    return { paths, mids, rows };
+  }
+  /* a plan at another size (the painting's) */
+  function scalePlan(pl, w, h) {
+    const k = w / pl.w;
+    if (Math.abs(k - 1) < 1e-6 && pl.h === h) return pl;
+    const strokes = pl.strokes.slice(), pts = new Float32Array(pl.pts.length);
+    for (let i = 0; i < pl.n; i++) strokes[i * 20 + 6] *= k;
+    for (let i = 0; i < pts.length; i++) pts[i] = pl.pts[i] * k;
+    return Object.assign({}, pl, { w, h, strokes, pts, edgeBase: pl.edgeBase * k, baseT: (pl.baseT || 0) * k });
+  }
+  /* planner.encode in JavaScript: the plan for the server ('OSP1') */
+  function encodePlan(pl) {
+    const head = JSON.stringify({ w: pl.w, h: pl.h, n: pl.n, m: pl.m, ncol: 20, gw: pl.gw, gh: pl.gh, scale: 1,
+      edge_base: pl.edgeBase, base_t: pl.baseT || 0 });
+    let hb = new TextEncoder().encode(head);
+    const hl = Math.ceil(hb.length / 4) * 4, hb2 = new Uint8Array(hl).fill(32); hb2.set(hb); hb = hb2;
+    const gl = Math.ceil(pl.ground.length / 4) * 4;
+    const buf = new ArrayBuffer(8 + hl + pl.n * 80 + pl.m * 8 + (pl.n + 1) * 4 + gl);
+    const u8 = new Uint8Array(buf), dv = new DataView(buf);
+    u8.set([79, 83, 80, 49]); dv.setUint32(4, hl, true); u8.set(hb, 8);
+    let at = 8 + hl;
+    u8.set(new Uint8Array(pl.strokes.buffer, pl.strokes.byteOffset, pl.n * 80), at); at += pl.n * 80;
+    u8.set(new Uint8Array(pl.pts.buffer, pl.pts.byteOffset, pl.m * 8), at); at += pl.m * 8;
+    u8.set(new Uint8Array(pl.offs.buffer, pl.offs.byteOffset, (pl.n + 1) * 4), at); at += (pl.n + 1) * 4;
+    u8.set(pl.ground, at);
+    return buf;
+  }
+
   let fx = null;
   const get = () => (fx = fx || new OilFX());
   /* a source picture at another size, made once and kept (the stage memo
@@ -1988,6 +2745,11 @@
 
   window.OilFX = {
     STYLES: Object.keys(PIPELINES),          /* styles the GPU can make */
+    /* Brush Strokes: plan every stroke on the graphics card (brushplan.py's steps).
+       src: the photo at the planning size; opts: {key, pxScale, groundSide,
+       shouldStop, onProgress}. Returns the plan live.js paints. */
+    planBrush(src, p, opts) { return get().planBrush(src, p, opts); },
+    scalePlan, encodePlan, _rnd: rndJ, _nrm: nrmJ, _fx: () => get(),
     SEED_KEY,
     has(style) { return style in PIPELINES; },
     get ok() { return get().ok; },

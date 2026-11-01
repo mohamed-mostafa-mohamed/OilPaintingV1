@@ -5,8 +5,30 @@ image and warps the shapes of objects into fantastic, wavy forms.
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
+
+
+def gblur(img: np.ndarray, sigma: float) -> np.ndarray:
+    """cv2.GaussianBlur(img, (0, 0), sigma), fast for a big sigma.
+
+    A wide blur of a big photo is slow (sigma 115 on 4000 x 3000: 8 s); the
+    same blur made on a smaller copy and enlarged looks the same (a blur
+    that wide has no fine detail to lose) and takes a few ms. Small sigmas
+    are blurred as they are."""
+    sigma = float(sigma)
+    if sigma < 8.0:
+        return cv2.GaussianBlur(img, (0, 0), sigma)
+    f = int(sigma // 4)                       # still >= 4 px of blur on the small copy
+    h, w = img.shape[:2]
+    sw, sh = max(1, round(w / f)), max(1, round(h / f))
+    small = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
+    # shrinking and enlarging blur a little by themselves (about f/2 px)
+    s_small = math.sqrt(max(sigma * sigma - (0.5 * f) ** 2, 1.0)) / f
+    small = cv2.GaussianBlur(small, (0, 0), s_small)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 def correct(img: np.ndarray, p: dict) -> np.ndarray:

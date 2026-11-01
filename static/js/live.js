@@ -814,14 +814,17 @@ window.addEventListener('unhandledrejection', e => window.logGpu('promise', e.re
       this.mode = mode;
 
       if (mode === 'B' && !this.holdPreview) {
+        if (dragging && this.planSidePending) { this.planSide = this.planSidePending; this.planSidePending = null; }
         const lk = layoutKey(p);
-        if (this.plan && this.plan.layoutKey === lk && !(this.plan.proxy && !dragging)) {
+        if (this.plan && this.plan.layoutKey === lk &&
+            (this.plan.side === 0 || this.plan.side === (this.planSide || PLAN_SIDE0))) {
           /* same strokes: only their look changed */
           if (this.lookKey !== this._lookKey(p)) this._restyle();
         } else if (lk === this.ranLayoutKey && this.state.has_plan) {
           this._requestPlan({ source: 'run', key: lk });
         } else {
-          this._requestPlan({ source: 'preview', params: p, proxy: dragging, key: lk });
+          /* one plan size, dragging or not: letting go does not change the strokes */
+          this._requestPlan({ source: 'preview', params: p, key: lk });
         }
         if (this.plan && this.lookKey !== this._lookKey(p)) this._restyle();
       } else if (mode === 'C' && !this.holdPreview) {
@@ -843,7 +846,8 @@ window.addEventListener('unhandledrejection', e => window.logGpu('promise', e.re
 
     /* -------------------------------------------------- stroke plans */
     _requestPlan(want) {
-      want.id = want.key + (want.source === 'run' ? '|run' : (want.proxy ? '|proxy' : '|full'));
+      want.side = want.source === 'run' ? undefined : (this.planSide || PLAN_SIDE0);
+      want.id = want.key + (want.source === 'run' ? '|run' : '|preview' + want.side);
       if (this.plan && this.plan.id === want.id) return;
       if (this.inflightPlan === want.id) return;
       this.wantPlan = want;
@@ -856,26 +860,78 @@ window.addEventListener('unhandledrejection', e => window.logGpu('promise', e.re
       this._emit('busy');
       const t0 = performance.now();
       try {
-        const res = await fetch('/api/live/plan', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ source: want.source, params: want.params, proxy: !!want.proxy })
-        });
-        if (res.status === 200) {
+        let plan = null, planMs = 0, how = 'server';
+        if (want.source !== 'run' && window.OilFX && window.OilFX.ok && window.OilFX.planBrush && !this.gpuPlanFailed) {
+          /* planned on the graphics card (oilfx.js planBrush - brushplan.py's steps) */
+          try {
+            const src = await this._brushSource(want.params, want.side);
+            const pl = await window.OilFX.planBrush(src.bm, want.params, { key: 'live:' + src.key,
+              pxScale: src.bm.width / src.baseW, groundSide: 700 });
+            plan = window.OilFX.scalePlan(pl, this.P[0], this.P[1]);
+            planMs = pl.ms; how = 'gpu';
+          } catch (err) {
+            /* a card that cannot plan: the server plans from now on */
+            this.gpuPlanFailed = true;
+            if (window.logGpu) window.logGpu('plan on the GPU', err);
+          }
+        }
+        if (!plan) {
+          const res = await fetch('/api/live/plan', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source: want.source, params: want.params, side: want.side })
+          });
+          if (res.status === 200) {
+            plan = parsePlan(await res.arrayBuffer());
+            planMs = 1000 * Number(res.headers.get('X-Plan-Seconds') || 0);
+          }
+        }
+        if (plan) {
           const t1 = performance.now();
-          const plan = parsePlan(await res.arrayBuffer());
-          plan.layoutKey = want.key; plan.id = want.id; plan.proxy = !!want.proxy;
+          plan.layoutKey = want.key; plan.id = want.id;
+          plan.side = want.source === 'run' ? 0 : want.side;
           this._setPlan(plan);
+          if (want.source !== 'run') this._planMeasure(planMs);
           if (this.wantPlan) await shownFrame();      /* on screen before the next plan */
           const n = (this.timeLogs = (this.timeLogs || 0) + 1);
           if (window.logGpu && n <= 60) window.logGpu('preview time', JSON.stringify({ style: 'Brush Strokes',
-            proxy: !!want.proxy, strokes: plan.n, server_ms: Math.round(t1 - t0),
-            server_plan_ms: Math.round(1000 * Number(res.headers.get('X-Plan-Seconds') || 0)),
-            gpu_ms: Math.round(performance.now() - t1) }));
+            side: want.side, strokes: plan.n, planned_on: how, total_ms: Math.round(t1 - t0),
+            plan_ms: Math.round(planMs), draw_ms: Math.round(performance.now() - t1) }));
         }
       } catch (err) { console.warn(err); }
       this.planBusy = false; this.inflightPlan = null;
       this._emit('busy');
       if (this.wantPlan) this._pumpPlan();
+    }
+    /* the photo the GPU plans from (distorted like the CPU's), kept */
+    async _brushSource(p, side) {
+      const dist = p.abstract_enabled && Number(p.dist_strength) > 0 ? [p.dist_strength, p.dist_curvature, p.dist_seed] : null;
+      const key = JSON.stringify([this.state && this.state.version, this.state && this.state.token, side, dist]);
+      if (this.bsrc && this.bsrc.key === key) return this.bsrc;
+      const res = await fetch('/api/brush/source', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ params: p, side }) });
+      if (!res.ok) throw new Error('Could not read the photo');
+      const bm = await createImageBitmap(await res.blob());
+      if (this.bsrc && this.bsrc.bm && this.bsrc.bm.close) this.bsrc.bm.close();
+      this.bsrc = { key, bm, baseW: Number(res.headers.get('X-Base-W')) || bm.width };
+      return this.bsrc;
+    }
+    /* Brush Strokes previews are planned at one size, picked once from how
+       fast this computer plans (about PLAN_BUDGET ms a plan): the strokes
+       while dragging are the strokes after letting go. The first plan of a
+       photo also reads the photo (slow), so the fastest of the first few
+       timings is used. */
+    _planMeasure(ms) {
+      if (this.planSideFixed || !(ms > 0)) return;
+      this.planTimes = (this.planTimes || []).concat(ms);
+      if (this.planTimes.length < 3) return;
+      const side = this.planSide || PLAN_SIDE0, best = Math.min(...this.planTimes);
+      let next = Math.round(side * Math.sqrt(PLAN_BUDGET / best) / 40) * 40;
+      next = Math.max(PLAN_MIN, Math.min(PLAN_MAX, next));
+      this.planSideFixed = true;
+      /* used from the next slider movement on (never on letting go, which
+         must show the strokes the drag showed) */
+      if (next !== side) this.planSidePending = next;
+      if (window.logGpu) window.logGpu('plan size', JSON.stringify({ side: next, timed_at: side, ms: Math.round(best) }));
     }
     /* ribbons of a plan into vertex/index buffers (a vertex array) */
     _uploadGeometry(geo, mesh = {}) {
@@ -1381,6 +1437,8 @@ window.addEventListener('unhandledrejection', e => window.logGpu('promise', e.re
     snapshot() { return this.canvas.toDataURL('image/png'); }
   }
 
+  const PLAN_SIDE0 = 800;        /* Brush Strokes preview plan: long side to start with */
+  const PLAN_MIN = 520, PLAN_MAX = 1200, PLAN_BUDGET = 300;   /* ... and its range; ms per plan */
   const FX_MIN = 720;            /* long side of a GPU style's preview: at least this... */
   const FX_FULL = 1600;          /* ... at most this (a Run is full size) */
   const FX_BUDGET = 220;         /* ms one preview may take: the size is picked for it (_fxMeasure) */

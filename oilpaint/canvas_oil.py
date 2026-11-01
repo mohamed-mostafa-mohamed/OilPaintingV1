@@ -47,7 +47,7 @@ def settings(p: dict) -> dict:
     f = lambda k, d: float(p.get(k, d)) / 100.0
     return {"patch": f("co_patch", 45), "detail": f("co_detail", 55), "drag": f("co_drag", 40),
             "dabs": f("co_dabs", 55), "relief": f("co_relief", 45), "canvas": f("co_canvas", 45),
-            "scratch": f("co_scratches", 20), "speck": f("co_speckles", 40),
+            "scratch": f("co_scratches", 20), "speck": 0.0,     # speckles (red / purple / white dots): taken out
             "brush": f("co_brush", 70), "size": f("co_stroke_size", 45), "loose": f("co_loose", 55),
             "sketch": f("co_sketch", 45), "contrast": f("co_contrast", 35), "vib": f("co_vibrance", 40),
             "seed": int(p.get("co_seed", 7)) % 100000}

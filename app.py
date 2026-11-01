@@ -27,6 +27,7 @@ from flask import (Flask, abort, jsonify, render_template, request,
                    send_file, session)
 
 from oilpaint import brushes as B
+from oilpaint import brushplan as BP
 from oilpaint import decoration as D
 from oilpaint import engine, params
 from oilpaint import planner as PL
@@ -62,7 +63,7 @@ ACTIONS_DIR = os.environ.get("OILSTUDIO_ACTIONS_DIR") or (
 MAX_UPLOAD_MB = 30
 # photos are kept at their own size (up to 6000 px, for memory)
 MAX_SOURCE_SIDE = 6000
-QUALITY = {"draft": 650, "normal": 1000, "high": 1500, "max": 2400}
+QUALITY = {"draft": 650, "max": 2400}            # Draft (quick look) and Max (the original size)
 # Max = the photo's own size (small photos are enlarged to at least this)
 MAX_QUALITY_MIN_SIDE = 2400
 # styles whose look lives in pixel-sized detail (grain, dot grid) are always
@@ -78,7 +79,7 @@ def _work_side(p, quality, src_side=MAX_SOURCE_SIDE):
     The template styles (Halftone, Oil Smear...) live on fine detail, so
     their steps are fractions of Max: 40 / 60 / 80 / 100 %."""
     mx = max(int(src_side), MAX_QUALITY_MIN_SIDE)
-    quality = quality if quality in QUALITY else "normal"
+    quality = quality if quality in QUALITY else "max"
     if quality == "max":
         return mx
     if p.get("paint_style") in FULL_SIZE_STYLES or p.get("paint_style") == "Canvas Oil":
@@ -436,8 +437,10 @@ def api_run():
         p = params.clean(body.get("params"))
         d.params = p
         d.deco_order = _clean_order(body.get("deco_order"))
-        quality = body.get("quality") if body.get("quality") in QUALITY else "normal"
+        quality = body.get("quality") if body.get("quality") in QUALITY else "max"
         shots = int(np.clip(int(body.get("snapshots", 8) or 8), 0, 16))
+        if int(p.get("samples", 4)) <= 1:
+            shots = 0           # 1 take = 1 picture in the Timeline (no in-between shots)
 
         work = work_image(d.source, p, quality)
         if d.original is None or d.original.shape != work.shape:
@@ -569,7 +572,7 @@ def api_gpu_plan():
     p = params.clean(body.get("params"))
     if p.get("paint_style") in params.CPU_STYLES:
         return jsonify(error=f"{p['paint_style']} is made on the CPU."), 400
-    quality = body.get("quality") if body.get("quality") in QUALITY else "normal"
+    quality = body.get("quality") if body.get("quality") in QUALITY else "max"
     with d.lock:
         if d.job and d.job["running"]:
             return jsonify(error="A painting is already in progress."), 409
@@ -581,12 +584,88 @@ def api_gpu_plan():
         token = d.token
     t0 = time.time()
     with d.plan_lock:
-        plan = PL.plan_preview(work, p, d.run_cache, token=(token, work.shape))
+        # planned on the server (the page could not plan on the GPU): the
+        # same steps and size as a Run planned on the graphics card
+        src = AB.distort(work.astype(np.float32), p) if PL.distortion_key(p) is not None else work
+        plan = BP.plan_bgr(src, p, side=BP.RUN_SIDE, cache=_bp_cache(d.run_cache), token=(token, work.shape))
     with d.lock:
         d.gpu_pending = {"plan": plan, "params": p, "shape": work.shape,
                          "order": _clean_order(body.get("deco_order")), "t0": t0}
     return _binary(PL.encode(plan, scale=1.0, ground_side=1200),
                    {"X-Plan-Seconds": f"{time.time() - t0:.3f}"})
+
+
+def _bp_cache(cache):
+    """The brushplan cache kept inside a planner.AnalysisCache."""
+    if cache is None:
+        return None
+    if cache.bp is None:
+        cache.bp = BP.Cache()
+    return cache.bp
+
+
+def _brush_source(base, p, side):
+    """The photo the stroke planner reads: Abstract distortion applied (like
+    the CPU), at most ``side`` long. -> PNG bytes and the size it was made from."""
+    src = base.astype(np.float32)
+    if PL.distortion_key(p) is not None:
+        src = AB.distort(src, p)
+    h, w = src.shape[:2]
+    if max(h, w) > side:
+        k = side / max(h, w)
+        src = cv2.resize(src, (max(1, int(round(w * k))), max(1, int(round(h * k)))), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".png", np.clip(np.round(src), 0, 255).astype(np.uint8), [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    if not ok:
+        abort(500, "Could not encode the image.")
+    return buf.tobytes()
+
+
+@app.post("/api/brush/prepare")
+def api_brush_prepare():
+    """Step 1 of a GPU Run of Brush Strokes: size the photo for the Quality
+    and send it at the planning size; the page plans and paints the strokes
+    on the graphics card and sends everything to /api/gpu/result."""
+    d = doc()
+    if d.source is None:
+        return jsonify(error="Open an image first."), 400
+    body = request.get_json(silent=True) or {}
+    p = params.clean(body.get("params"))
+    quality = body.get("quality") if body.get("quality") in QUALITY else "max"
+    with d.lock:
+        if d.job and d.job["running"]:
+            return jsonify(error="A painting is already in progress."), 409
+        work = work_image(d.source, p, quality)
+        if d.original is None or d.original.shape != work.shape:
+            d.live_cache = PL.AnalysisCache()
+            d.proxy_cache = PL.AnalysisCache()
+        d.original = work
+        d.gpu_pending = {"plan": None, "params": p, "shape": work.shape,
+                         "order": _clean_order(body.get("deco_order")), "t0": time.time()}
+    h, w = work.shape[:2]
+    resp = send_file(io.BytesIO(_brush_source(work, p, BP.RUN_SIDE)), mimetype="image/png")
+    resp.headers["X-Work-W"], resp.headers["X-Work-H"] = str(w), str(h)
+    return resp
+
+
+@app.post("/api/brush/source")
+def api_brush_source():
+    """The photo a live preview of Brush Strokes is planned from (on the GPU)."""
+    d = doc()
+    body = request.get_json(silent=True) or {}
+    p = params.clean(body.get("params"))
+    with d.lock:
+        base = d.original if d.original is not None else d.source
+        if base is None:
+            abort(409, "No image is open.")
+    try:
+        side = int(np.clip(int(body.get("side") or LIVE_SIDE), 200, BP.RUN_SIDE))
+    except (TypeError, ValueError):
+        side = LIVE_SIDE
+    h, w = base.shape[:2]
+    resp = send_file(io.BytesIO(_brush_source(base, p, side)), mimetype="image/png")
+    resp.headers["X-Base-W"], resp.headers["X-Base-H"] = str(w), str(h)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # --------------------------------------------------------------------------
@@ -651,7 +730,7 @@ def api_fx_prepare():
     p = params.clean(body.get("params"))
     if p.get("paint_style") not in params.GPU_FILTER_STYLES:
         return jsonify(error=f"{p.get('paint_style')} has no GPU filter version."), 400
-    quality = body.get("quality") if body.get("quality") in QUALITY else "normal"
+    quality = body.get("quality") if body.get("quality") in QUALITY else "max"
     with d.lock:
         if d.job and d.job["running"]:
             return jsonify(error="A painting is already in progress."), 409
@@ -818,13 +897,23 @@ def api_fx_result():
 @app.post("/api/gpu/result")
 def api_gpu_result():
     """Step 2 of a GPU Run: the bare painting (PNG), its paint height
-    (float16) and the Timeline shots (JPEG) painted by the browser."""
+    (float16), the Timeline shots (JPEG) and - when the page planned the
+    strokes on the GPU - the plan, all made by the browser."""
     d = doc()
     with d.lock:
         pend = getattr(d, "gpu_pending", None)
     if not pend:
         return jsonify(error="Plan the painting first."), 409
     h, w = pend["shape"][:2]
+    plan = pend.get("plan")
+    pf = request.files.get("plan")
+    if pf is not None:
+        try:
+            plan = PL.decode(pf.read(), size=(w, h))
+        except (ValueError, KeyError, TypeError):
+            return jsonify(error="The planned strokes could not be read."), 400
+    if plan is None:
+        return jsonify(error="Missing the planned strokes."), 400
     f = request.files.get("canvas")
     hb = request.files.get("height")
     if f is None or hb is None:
@@ -864,7 +953,7 @@ def api_gpu_result():
         d.painting = result.astype(np.float32)
         d.edited = d.painting.copy()
         d.height = np.zeros((h, w), np.float32)
-        d.set_layers(canvas, height, engine.FINISH_ALL, pend["plan"], ran=p, p=p)
+        d.set_layers(canvas, height, engine.FINISH_ALL, plan, ran=p, p=p)
         d.undo.clear()
         d.redo.clear()
         d.selected = len(d.shots) - 1
@@ -872,7 +961,7 @@ def api_gpu_result():
         d.gpu_pending = None
         d.bump()
         seconds = round(time.time() - pend["t0"], 2)
-    return jsonify(ok=True, version=d.version, strokes=pend["plan"].count,
+    return jsonify(ok=True, version=d.version, strokes=plan.count,
                    seconds=seconds, gpu_seconds=round(gpu_seconds, 2))
 
 
@@ -1208,6 +1297,21 @@ def api_preset_delete(name):
 # --------------------------------------------------------------------------
 
 
+@app.get("/api/size")
+def api_size():
+    """Image Size (Ctrl/Cmd+Alt+I): the photo's size and the painting's."""
+    d = doc()
+    with d.lock:
+        src = None if d.source is None else d.source.shape[:2]
+        out = d.display()
+        out = None if out is None else out.shape[:2]
+    return jsonify(photo=None if src is None else {"w": src[1], "h": src[0]},
+                   painting=None if out is None else {"w": out[1], "h": out[0]})
+
+
+MAX_EXPORT_SIDE = 12000
+
+
 @app.get("/api/export")
 def api_export():
     d = doc()
@@ -1216,6 +1320,15 @@ def api_export():
         out = d.display()
     if out is None:
         abort(409, "Nothing has been painted yet.")
+    # Image Size: save at another size (w and h in pixels)
+    try:
+        tw, th = int(request.args.get("w") or 0), int(request.args.get("h") or 0)
+    except ValueError:
+        tw = th = 0
+    if tw > 0 and th > 0 and (tw, th) != (out.shape[1], out.shape[0]):
+        tw, th = min(max(tw, 16), MAX_EXPORT_SIDE), min(max(th, 16), MAX_EXPORT_SIDE)
+        smaller = tw * th < out.shape[0] * out.shape[1]
+        out = cv2.resize(out, (tw, th), interpolation=cv2.INTER_AREA if smaller else cv2.INTER_LANCZOS4)
     stem = os.path.splitext(d.name)[0] or "painting"
     if fmt == "png":
         ok, buf = cv2.imencode(".png", out)
@@ -1245,7 +1358,7 @@ def api_batch():
     p = params.clean(_json.loads(request.form.get("params") or "{}"))
     order = _clean_order(_json.loads(request.form.get("deco_order") or "null"))
     q = request.form.get("quality")
-    qual = q if q in QUALITY else "normal"
+    qual = q if q in QUALITY else "max"
     fmt = (request.form.get("format") or "jpg").lower()
 
     buf = io.BytesIO()
@@ -1411,6 +1524,11 @@ def api_live_plan():
         token = d.token
     proxy = bool(body.get("proxy"))
     side = PROXY_SIDE if proxy else LIVE_SIDE
+    try:                                    # the page picks one size for dragging and letting go
+        if body.get("side"):
+            side, proxy = int(np.clip(int(body["side"]), 320, LIVE_SIDE)), False
+    except (TypeError, ValueError):
+        pass
     src = fit(base, side)
     t0 = time.time()
     with d.plan_lock:
@@ -1552,11 +1670,35 @@ def api_act_open_folder():
 MAX_PACK_UPLOAD_MB = 1024           # Envato pattern (.pat) / brush (.abr) files can be big
 
 
+# The 30 MB limit is for one photo the user opens. Some uploads are bigger:
+#  * the page sends a GPU Run's painting back (painting PNG + float16 paint
+#    height + shots): at Max size a big photo is 100+ MB - over 30 MB the
+#    GPU Run failed and fell back to the CPU ("That upload is larger than 30 MB")
+#  * batches send up to 24 photos at once
+#  * action packs (.pat / .abr) can be huge
+# The server only listens on this computer (127.0.0.1), so these are local.
+MAX_RESULT_UPLOAD_MB = 2048
+RESULT_ROUTES = ("/api/gpu/result", "/api/fx/result", "/api/take")
+BATCH_ROUTES = ("/api/batch", "/api/actions/batch")
+MAX_BATCH_UPLOAD_MB = 24 * MAX_UPLOAD_MB
+
+
+def _upload_limit_mb(path):
+    if path == "/api/actions/add-pack":
+        return MAX_PACK_UPLOAD_MB
+    if path in RESULT_ROUTES:
+        return MAX_RESULT_UPLOAD_MB
+    if path in BATCH_ROUTES:
+        return MAX_BATCH_UPLOAD_MB
+    return MAX_UPLOAD_MB
+
+
 @app.before_request
 def _bigger_limit_for_packs():
-    if request.path == "/api/actions/add-pack":
+    mb = _upload_limit_mb(request.path)
+    if mb != MAX_UPLOAD_MB:
         try:
-            request.max_content_length = MAX_PACK_UPLOAD_MB * 1024 * 1024   # Flask >= 3.1
+            request.max_content_length = mb * 1024 * 1024   # Flask >= 3.1
         except AttributeError:
             pass
 
@@ -1730,7 +1872,7 @@ def api_act_batch():
 
 @app.errorhandler(413)
 def too_large(_):
-    limit = MAX_PACK_UPLOAD_MB if request.path == "/api/actions/add-pack" else MAX_UPLOAD_MB
+    limit = _upload_limit_mb(request.path)
     return jsonify(error=f"That upload is larger than {limit} MB."), 413
 
 

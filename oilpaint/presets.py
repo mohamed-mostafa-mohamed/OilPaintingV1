@@ -100,26 +100,26 @@ BUILTIN = {
     # native recreation of the Envato "Canvas Oil Painting" action
     "Canvas Oil": dict(paint_style="Canvas Oil"),
     "Canvas Oil - Clean (no scratches)": dict(
-        paint_style="Canvas Oil", co_scratches=0, co_speckles=20),
+        paint_style="Canvas Oil", co_scratches=0),
     "Canvas Oil - Bold Knife": dict(
         paint_style="Canvas Oil", co_stroke_size=65, co_patch=70, co_detail=40, co_drag=55,
         co_dabs=70, co_relief=65, co_scratches=35, co_contrast=45,
         co_vibrance=55),
     "Canvas Oil - Fine Detail": dict(
         paint_style="Canvas Oil", co_patch=25, co_detail=75, co_drag=30,
-        co_dabs=40, co_relief=40, co_scratches=10, co_speckles=25,
+        co_dabs=40, co_relief=40, co_scratches=10,
         co_stroke_size=25),
     "Canvas Oil - Thick Brush": dict(
         paint_style="Canvas Oil", co_brush=100, co_stroke_size=75,
-        co_patch=55, co_scratches=10, co_speckles=25),
+        co_patch=55, co_scratches=10),
     "Canvas Oil - Flat Knife (fast)": dict(
         paint_style="Canvas Oil", co_brush=0, co_sketch=0),
     "Canvas Oil - Sketchy": dict(
         paint_style="Canvas Oil", co_brush=80, co_loose=80, co_sketch=80,
-        co_stroke_size=55, co_scratches=10, co_speckles=25),
+        co_stroke_size=55, co_scratches=10),
     "Canvas Oil - Smooth": dict(
         paint_style="Canvas Oil", co_brush=80, co_loose=20, co_sketch=0,
-        co_scratches=0, co_speckles=20),
+        co_scratches=0),
     # vintage halftone print (halftone.py)
     "Halftone - Vintage Sepia": dict(paint_style="Halftone"),
     "Halftone - Clean Print (no scratches)": dict(

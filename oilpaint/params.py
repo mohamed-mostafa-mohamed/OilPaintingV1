@@ -118,7 +118,7 @@ CANVAS_OIL = {
     "co_relief": (45, 0, 100),          # paint ridges along patch edges
     "co_canvas": (45, 0, 100),          # white canvas and weave showing through
     "co_scratches": (20, 0, 100),       # cross-hatched knife scratches
-    "co_speckles": (40, 0, 100),        # small glowing paint spots
+    "co_speckles": (0, 0, 100),         # no longer used (the coloured dots were taken out)
     "co_contrast": (35, 0, 100),        # Levels
     "co_vibrance": (40, -100, 100),     # Vibrance
     "co_seed": (7, 0, 9999),
@@ -235,7 +235,7 @@ WATERCOLOR = {
 # the template styles (Canvas Oil, Halftone, Painted Photo, Impression,
 # Oil Smear) make several variations per Run, each with its own random seed
 SAMPLES = {
-    "samples": (8, 1, 16),
+    "samples": (4, 1, 16),
 }
 # Silk Oil: soft oil smears with fine bristle streaks, an impasto texture and
 # diagonal light - see silkoil.py (100 = the template on every slider)

@@ -126,12 +126,16 @@ def oil_brush(img, height, path, colour, size=40, relief=50, reserve=50,
         y = int(np.clip(mid[1], 0, img.shape[0] - 1))
         colour = colour * 0.55 + img[y, x] * 0.45
 
+    # Reserve = how much paint the brush carries. The stroke always covers
+    # the whole path the user drew (before, a low reserve cut it off: at 50
+    # only the first ~60 % was painted); less paint = a thinner, more
+    # see-through layer with less relief
     res = float(np.clip(reserve, 0, 100)) / 100.0
     brush.stroke(pts, colour, thickness, hair, bristles,
-                 softness=0.35, opacity=1.0,
-                 height_amt=0.6 + 2.4 * (float(relief) / 100.0),
+                 softness=0.35, opacity=0.72 + 0.28 * res,
+                 height_amt=(0.6 + 2.4 * (float(relief) / 100.0)) * (0.6 + 0.4 * res),
                  shade_var=0.10 + 0.20 * (float(relief) / 100.0),
-                 rng=rng, flat=flat, reserve=0.25 + 0.75 * res,
+                 rng=rng, flat=flat, reserve=1.0,
                  mixing=mixing)
 
     _relight(img, height, cov, float(relief) / 100.0)

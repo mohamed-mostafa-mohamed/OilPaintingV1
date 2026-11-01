@@ -154,6 +154,7 @@ class AnalysisCache:
     """
 
     def __init__(self):
+        self.bp = None          # brushplan.Cache (the planner since version 2)
         self.token = None
         self.base_key = None
         self.base = None
@@ -189,20 +190,29 @@ def analyse(src: np.ndarray, p: dict, cache: AnalysisCache | None = None, token=
     rkey = (bkey, int(p["simplicity"]))
     if cache.ref_key != rkey:
         work = cache.base["work"]
-        ref = simplify(work, int(p["simplicity"]))
-        ref_fine = simplify(work, int(p["simplicity"]), scale_boost=0.45)
+        # the two abstractions side by side (OpenCV lets go of Python while
+        # it works): on a big photo each takes seconds
+        if work.shape[0] * work.shape[1] > 1_500_000:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(2) as ex:
+                f1 = ex.submit(simplify, work, int(p["simplicity"]))
+                f2 = ex.submit(simplify, work, int(p["simplicity"]), 0.45)
+                ref, ref_fine = f1.result(), f2.result()
+        else:
+            ref = simplify(work, int(p["simplicity"]))
+            ref_fine = simplify(work, int(p["simplicity"]), scale_boost=0.45)
         gray = cv2.cvtColor(np.clip(ref_fine, 0, 255).astype(np.uint8),
                             cv2.COLOR_BGR2GRAY).astype(np.float32)
         tensor = structure_tensor(gray)
         grad = tensor["grad"]
 
-        blur_g = cv2.GaussianBlur(gray, (0, 0), max(2.0, small_side(gray) / 160.0))
+        blur_g = ab.gblur(gray, max(2.0, small_side(gray) / 160.0))
         texture = cv2.GaussianBlur(np.abs(gray - blur_g), (0, 0), 6.0)
         tmax = float(np.percentile(texture, 92)) + 1e-6
         texture = np.clip(texture / tmax, 0.0, 1.0).astype(np.float32)
 
         open_sigma = max(4.0, small_side(gray) / 26.0)
-        openness = cv2.GaussianBlur(grad, (0, 0), open_sigma)
+        openness = ab.gblur(grad, open_sigma)
         omax = float(np.percentile(openness, 92)) + 1e-6
         openness = np.clip(openness / omax, 0.0, 1.0).astype(np.float32)
 
@@ -264,7 +274,7 @@ def make_ground(ref: np.ndarray, p: dict, lay: dict) -> np.ndarray:
     canvas_rgb = np.array(hex_to_bgr(p.get("canvas_color", "#f3ece0")), np.float32)
     canvas = np.empty((h, w, 3), np.float32)
     canvas[:] = canvas_rgb
-    ground = cv2.GaussianBlur(ref, (0, 0), max(1.5, lay["base_t"] * 0.85))
+    ground = ab.gblur(ref, max(1.5, lay["base_t"] * 0.85))
     canvas += (ground - canvas) * float(np.clip(lay["filling"], 0.0, 1.0)) * 0.92
     return canvas
 
@@ -467,8 +477,8 @@ def layer_refs(an, lay, li):
     sigma = max(0.7, radii[li] * 0.50)
     mix = 0.0 if len(radii) == 1 else (li / (len(radii) - 1.0)) ** 0.85
     ref_src = ref if mix <= 0.001 else (ref + (ref_fine - ref) * mix)
-    ref_l = cv2.GaussianBlur(ref_src, (0, 0), sigma)
-    ref_s = cv2.GaussianBlur(ref_src, (0, 0), max(0.5, sigma * 0.35))
+    ref_l = ab.gblur(ref_src, sigma)
+    ref_s = ab.gblur(ref_src, max(0.5, sigma * 0.35))
     if memo is not None:
         if len(memo) > 24:
             memo.clear()
@@ -588,7 +598,7 @@ def plan_fill(an, lay, coverage, rng):
     pick = rng.permutation(len(ys))[:budget]
     n = len(pick)
     r = max(1.6, lay["base_t"] * 0.42)
-    ref_l = cv2.GaussianBlur(ref, (0, 0), max(0.8, r * 0.6))
+    ref_l = ab.gblur(ref, max(0.8, r * 0.6))
     ix = np.clip(xs[pick] * 6 + rng.integers(0, 6, n), 0, w - 1).astype(np.int32)
     iy = np.clip(ys[pick] * 6 + rng.integers(0, 6, n), 0, h - 1).astype(np.int32)
     base = ref_l[iy, ix].astype(np.float32)
@@ -857,6 +867,31 @@ def footprint(pts, offs, widths, shape, scale=0.25):
 
 def plan_preview(src: np.ndarray, p: dict, cache: AnalysisCache | None = None,
                  token=None, px_scale=1.0) -> Plan:
+    """Plan the whole painting (BGR 0..255 picture, planned at its own size).
+
+    Since version 2 this is brushplan.plan: the same steps the GPU runs
+    (static/js/oilfx.js planBrush). The old planner below is kept for
+    reference and tests (plan_preview_v1)."""
+    from . import brushplan as BP
+    bc = None
+    if isinstance(cache, AnalysisCache):
+        if cache.bp is None:
+            cache.bp = BP.Cache()
+        bc = cache.bp
+    src = np.asarray(src, np.float32)
+    if distortion_key(p) is not None:
+        src = ab.distort(src, p)
+    rgb = np.ascontiguousarray(src[..., ::-1]) / 255.0
+    return BP.plan(rgb.astype(np.float32), p, bc, token, px_scale=px_scale)
+
+
+def plan_preview_v1(src: np.ndarray, p: dict, cache: AnalysisCache | None = None,
+                    token=None, px_scale=1.0) -> Plan:
+    """Plan the whole painting without painting it (approximate mode)."""
+    return _plan_preview_v1(src, p, cache, token, px_scale)
+
+
+def _plan_preview_v1(src, p, cache=None, token=None, px_scale=1.0):
     """Plan the whole painting without painting it (approximate mode).
 
     The finishing layers need to know where the canvas still differs from
@@ -907,6 +942,32 @@ def plan_preview(src: np.ndarray, p: dict, cache: AnalysisCache | None = None,
 # --------------------------------------------------------------------------
 # binary encoding for the browser
 # --------------------------------------------------------------------------
+
+
+def decode(buf: bytes, size=None) -> Plan:
+    """A plan sent by the page (static/js/oilfx.js encodePlan, the same
+    layout as encode). ``size`` (w, h): the ground is enlarged to it."""
+    import json
+    import struct
+    magic, hl = struct.unpack_from("<4sI", buf, 0)
+    if magic != b"OSP1":
+        raise ValueError("Not a plan")
+    head = json.loads(buf[8:8 + hl].decode())
+    at = 8 + hl
+    n, m, ncol = int(head["n"]), int(head["m"]), int(head.get("ncol", NCOL))
+    if ncol != NCOL or n < 0 or m < 0 or n > 5_000_000 or m > 200_000_000:
+        raise ValueError("Bad plan")
+    st = np.frombuffer(buf, "<f4", n * ncol, at).reshape(n, ncol).astype(np.float32); at += n * ncol * 4
+    pts = np.frombuffer(buf, "<f4", m * 2, at).reshape(m, 2).astype(np.float32); at += m * 8
+    offs = np.frombuffer(buf, "<u4", n + 1, at).astype(np.int32); at += (n + 1) * 4
+    gw, gh = int(head["gw"]), int(head["gh"])
+    g = np.frombuffer(buf, np.uint8, gw * gh * 3, at).reshape(gh, gw, 3)
+    if offs[-1] != m or (n and offs.min() < 0):
+        raise ValueError("Bad plan")
+    w, h = size or (int(head["w"]), int(head["h"]))
+    ground = cv2.resize(cv2.cvtColor(g, cv2.COLOR_RGB2BGR), (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    return Plan(size=(w, h), strokes=st, pts=pts, offs=offs, ground=ground,
+                meta={"base_t": float(head.get("base_t", 0)), "edge_base": float(head.get("edge_base", 0))})
 
 
 def encode(plan: Plan, scale: float = 1.0, ground_side: int = 0) -> bytes:

@@ -111,7 +111,7 @@ function syncStyle() {
   $('#style-note').textContent = silk
     ? 'Soft oil smears with fine bristle streaks, an impasto texture and a diagonal light, from a Photoshop template. Runs on the GPU or the CPU.'
     : canvasOil
-    ? 'Knife-cut paint patches dragged into brush strokes, with sketch lines, canvas, scratches and speckles, like the Envato “Canvas Oil Painting” action. Made on the graphics card in a moment. Set Brush Strokes to 0 for flat knife patches.'
+    ? 'Knife-cut paint patches dragged into brush strokes, with sketch lines, canvas and scratches, like the Envato “Canvas Oil Painting” action. Made on the graphics card in a moment. Set Brush Strokes to 0 for flat knife patches.'
     : halftone
       ? 'A vintage halftone print: sepia ink, stipple grain, a woven dot grid and light scratches. Pick your own ink and paper colours below.'
       : painted
@@ -408,7 +408,9 @@ function refreshEdits() {
 }
 function showAfterView() { updateView(); }
 function updateView() {
-  const after = mainShowsAfter() && !state.peek;
+  /* the button at the bottom left (or B) shows the other one while held:
+     on After it shows Before, on Before it shows After */
+  const after = state.painted && (mainShowsAfter() !== state.peek);
   $('#img-before').hidden = after;
   $('#img-after').hidden = !after || liveOn();
   if (live.canvas) live.canvas.hidden = !after || !liveOn();
@@ -416,7 +418,11 @@ function updateView() {
   $('#viewport-b').hidden = !split;
   $('#label-after').hidden = !split;
   $('#label-after').textContent = state.peek ? 'Before' : 'After';
-  $('#btn-peek').hidden = !mainShowsAfter();
+  $('#btn-peek').hidden = !state.painted;
+  const other = mainShowsAfter() ? 'Before' : 'After';
+  $('#peek-label').textContent = other;
+  $('#btn-peek').title = mainShowsAfter() ? 'Hold to see the original photograph (or hold the B key)'
+                                          : 'Hold to see the painting (or hold the B key)';
   updatePanCursor();
 }
 
@@ -629,6 +635,11 @@ function renderToolOptions() {
   $$('.topt', box).forEach(el => el.oninput = () => {
     o[el.dataset.k] = Number(el.value);
     $$(`.topt[data-k="${el.dataset.k}"]`, box).forEach(x => { x.value = el.value; });
+    if (el.dataset.k === 'size') {          /* show the new size on the picture */
+      clearTimeout(state.ringTimer);
+      state.ringFlash = true; drawOverlay();
+      state.ringTimer = setTimeout(() => { state.ringFlash = false; drawOverlay(); }, 1200);
+    }
   });
   $$('.topt-check', box).forEach(el => el.onchange = () => { o[el.dataset.k] = el.checked; });
   const col = $('.topt-colour', box);
@@ -643,10 +654,72 @@ function toNorm(evt) {
   return [(evt.clientX - r.left) / r.width, (evt.clientY - r.top) / r.height];
 }
 
+/* Brush size by dragging (like Photoshop): drag right = bigger, left = smaller
+     Windows: Ctrl+Alt + left-drag, or Alt + right-drag
+     Mac:     Ctrl+Option + left-drag (or Option + right-drag)            */
+const isSizeDrag = e => (e.ctrlKey && e.altKey && e.button === 0) || (e.altKey && !e.ctrlKey && e.button === 2);
+function startSizeDrag(e) {
+  const spec = window.TOOLS[state.tool];
+  const p = spec && (spec.params || []).find(x => x[0] === 'size');
+  if (!p || state.tab !== 'after' || !state.painted) return false;
+  e.preventDefault();
+  const o = state.toolOpts[state.tool] || (state.toolOpts[state.tool] = {});
+  const x0 = e.clientX, s0 = toolSize(), anchor = toNorm(e);
+  const perPx = 2 * 1000 / Math.max(overlay.width, overlay.height);     /* size units per screen px */
+  overlay.setPointerCapture(e.pointerId);
+  state.sizing = anchor; state.hover = anchor; drawOverlay();
+  const move = ev => {
+    const v = Math.round(Math.max(p[1], Math.min(p[2], s0 + (ev.clientX - x0) * perPx)));
+    if (v === o.size) return;
+    o.size = v;
+    $$('#tool-options .topt[data-k="size"]').forEach(x => { x.value = v; });
+    state.hover = anchor; drawOverlay();          /* the circle stays where the drag began */
+  };
+  const up = () => {
+    overlay.removeEventListener('pointermove', move);
+    overlay.removeEventListener('pointerup', up);
+    overlay.removeEventListener('pointercancel', up);
+    state.sizing = null; drawOverlay();
+  };
+  overlay.addEventListener('pointermove', move);
+  overlay.addEventListener('pointerup', up);
+  overlay.addEventListener('pointercancel', up);
+  return true;
+}
+
+/* Zoom tool (Z): click = zoom in (Alt/Option+click = out); press and drag
+   right = zoom in, drag left = zoom out (Photoshop's scrubby zoom) */
+function startZoomDrag(e, alwaysIn = false) {
+  e.preventDefault();
+  const x0 = e.clientX, y0 = e.clientY, z0 = state.zoom || 1;
+  let dragged = false;
+  overlay.setPointerCapture(e.pointerId);
+  const move = ev => {
+    const dx = ev.clientX - x0;
+    if (!dragged && Math.abs(dx) < 4) return;
+    dragged = true;
+    zoomAt(z0 * Math.exp(dx / 160), x0, y0);
+  };
+  const up = () => {
+    overlay.removeEventListener('pointermove', move);
+    overlay.removeEventListener('pointerup', up);
+    overlay.removeEventListener('pointercancel', up);
+    if (!dragged) zoomAt(z0 * (!alwaysIn && (e.altKey || e.button === 2) ? 1 / 1.3 : 1.3), x0, y0);
+  };
+  overlay.addEventListener('pointermove', move);
+  overlay.addEventListener('pointerup', up);
+  overlay.addEventListener('pointercancel', up);
+}
+
 overlay.addEventListener('pointerdown', e => {
   if (!state.open) return;
+  /* Ctrl+Alt (Mac: Ctrl+Option) + right click: zoom in, with any tool
+     (hold and drag right / left to zoom in / out) */
+  if (e.ctrlKey && e.altKey && e.button === 2) { startZoomDrag(e, true); return; }
+  if (isSizeDrag(e) && startSizeDrag(e)) return;
+  if (state.tool === 'zoom' && (e.button === 0 || e.button === 2)) { startZoomDrag(e); return; }
+  if (e.button !== 0) return;                        /* the brushes and lines: left button only */
   if (state.tool === 'pan') { startPan(e); return; }
-  if (state.tool === 'zoom') { zoomAt((state.zoom || 1) * (e.altKey ? 1 / 1.3 : 1.3), e.clientX, e.clientY); return; }
   if (state.tool === 'eraser') { eraseGuide(toNorm(e)); return; }
   if (state.tab === 'before' && state.tool !== 'direction') return;
   if (state.tab === 'after' && !window.TOOLS[state.tool]) return;
@@ -662,7 +735,7 @@ overlay.addEventListener('pointerdown', e => {
 });
 
 overlay.addEventListener('pointermove', e => {
-  if (!state.drawing) return;
+  if (!state.drawing || state.sizing) return;
   const p = toNorm(e);
   const last = state.drawing[state.drawing.length - 1];
   if (Math.hypot(p[0] - last[0], p[1] - last[1]) < 0.002) return;
@@ -674,14 +747,15 @@ function endStroke() {
   const path = state.drawing;
   state.drawing = null;
   if (!path || path.length < 2) { drawOverlay(); return; }
-  if (state.tab === 'before') { state.guides.push(path); drawOverlay(); settingsChanged('guides'); }
+  if (state.tab === 'before') { state.guides.push(path); state.guidesRedo = []; drawOverlay(); settingsChanged('guides'); }
   else sendBrush(path);
 }
 overlay.addEventListener('pointerup', endStroke);
 overlay.addEventListener('pointercancel', endStroke);
 
+const ERASE_REACH = 0.02;          /* how near a click must be to a guiding line */
 function eraseGuide([x, y]) {
-  const tol = 0.02;
+  const tol = ERASE_REACH;
   for (let i = state.guides.length - 1; i >= 0; i--) {
     if (state.guides[i].some(p => Math.hypot(p[0] - x, p[1] - y) < tol)) {
       state.guides.splice(i, 1); drawOverlay(); settingsChanged('guides'); return;
@@ -695,8 +769,6 @@ function drawOverlay() {
   const paths = state.tab === 'before'
     ? state.guides.concat(state.drawing ? [state.drawing] : [])
     : (state.drawing ? [state.drawing] : []);
-  if (!paths.length) return;
-
   ctx.lineCap = 'round'; ctx.lineJoin = 'round';
   paths.forEach(path => {
     ctx.beginPath();
@@ -708,13 +780,44 @@ function drawOverlay() {
       ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.lineWidth = 5; ctx.stroke();
       ctx.strokeStyle = '#f0a85c'; ctx.lineWidth = 2.2; ctx.stroke();
     } else {
-      const size = (state.toolOpts[state.tool] || {}).size || 40;
       ctx.strokeStyle = 'rgba(240,168,92,.45)';
-      ctx.lineWidth = Math.max(2, size * (c.width / 1000));
+      ctx.lineWidth = Math.max(2, 2 * brushRadius(c));
       ctx.stroke();
     }
   });
+  drawRing(c, ctx);
 }
+
+/* the brush size as a circle under the mouse (and at the middle of the
+   picture while its Size slider is dragged) */
+function toolSize() {
+  const spec = window.TOOLS[state.tool];
+  if (!spec) return 0;
+  const o = state.toolOpts[state.tool] || {};
+  const p = (spec.params || []).find(x => x[0] === 'size');
+  return p ? Number(o.size !== undefined ? o.size : p[3]) : 0;
+}
+/* in overlay pixels: the server makes a brush `size` thousandths of the
+   picture's long side wide */
+function brushRadius(c) { return toolSize() / 2 * Math.max(c.width, c.height) / 1000; }
+function drawRing(c, ctx) {
+  const at = state.hover || (state.ringFlash ? [0.5, 0.5] : null);
+  if (!at || state.drawing && state.tab === 'before') return;
+  let rx = 0, ry = 0;
+  if (state.tab === 'after' && window.TOOLS[state.tool] && state.painted) rx = ry = brushRadius(c);
+  else if (state.tab === 'before' && state.tool === 'eraser') { rx = ERASE_REACH * c.width; ry = ERASE_REACH * c.height; }
+  if (rx < 0.5) return;
+  const x = at[0] * c.width, y = at[1] * c.height;
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.stroke();
+  ctx.lineWidth = 1.4; ctx.strokeStyle = 'rgba(255,255,255,.95)'; ctx.stroke();
+  ctx.restore();
+}
+let ringRaf = 0;
+function redrawRing() { if (!ringRaf) ringRaf = requestAnimationFrame(() => { ringRaf = 0; drawOverlay(); }); }
+overlay.addEventListener('pointermove', e => { if (state.sizing) return; state.hover = toNorm(e); if (!state.drawing) redrawRing(); });
+overlay.addEventListener('pointerleave', () => { state.hover = null; redrawRing(); });
 
 async function sendBrush(path) {
   drawOverlay();
@@ -818,27 +921,50 @@ async function gpuRun() {
   const run = gpuRunStart();
   try {
     /* Variations: the same settings with other Random Seeds, painted first;
-       the settings on screen are painted last (its plan stays on the server) */
+       the settings on screen are painted last (its plan stays on the server).
+       The strokes are planned on the graphics card too (oilfx.js planBrush,
+       the same steps as the CPU's brushplan.py); without it the server plans. */
     const n = Math.max(1, Math.min(16, Number(p.samples) || 1));
     const base = Number(p.random_seed) || 0;
-    let out = null;
+    const onGpu = window.OilFX && window.OilFX.ok && window.OilFX.planBrush;
+    let src = null, workW = 0, workH = 0;
+    if (onGpu) {
+      run.bar(0.02); run.label('Preparing the photo');
+      const res = await fetch('/api/brush/prepare', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: run.signal,
+        body: JSON.stringify({ params: p, quality, deco_order: decoOrder() })
+      });
+      if (run.stopped()) return run.stop();
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Preparing failed');
+      workW = Number(res.headers.get('X-Work-W')); workH = Number(res.headers.get('X-Work-H'));
+      src = await createImageBitmap(await res.blob());
+    }
+    let out = null, plan = null;
     for (let i = 0; i < n; i++) {
       const last = i === n - 1;
       const q = Object.assign({}, p, { random_seed: last ? base : (base + i + 1) % 10000 });
       const part = f => run.bar(0.04 + 0.86 * (i + f) / n);
       part(0); run.label(n > 1 ? `Variation ${i + 1} of ${n}: planning the strokes` : 'Planning the strokes');
-      const res = await fetch('/api/gpu/plan', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: run.signal,
-        body: JSON.stringify({ params: q, quality, deco_order: decoOrder() })
-      });
-      if (run.stopped()) return run.stop();
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Planning failed');
-      const plan = window.OilLive.parsePlan(await res.arrayBuffer());
+      if (onGpu) {
+        const pl = await window.OilFX.planBrush(src, q, { key: 'run:' + run.id, pxScale: src.width / workW,
+          groundSide: 1200, shouldStop: run.stopped, onProgress: f => part(0.30 * f) });
+        if (run.stopped()) return run.stop();
+        if (window.logGpu && i === 0) window.logGpu('brush plan', JSON.stringify({ ms: pl.ms, strokes: pl.n, w: pl.w, h: pl.h }));
+        plan = window.OilFX.scalePlan(pl, workW, workH);
+      } else {
+        const res = await fetch('/api/gpu/plan', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: run.signal,
+          body: JSON.stringify({ params: q, quality, deco_order: decoOrder() })
+        });
+        if (run.stopped()) return run.stop();
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Planning failed');
+        plan = window.OilLive.parsePlan(await res.arrayBuffer());
+      }
       run.label(n > 1 ? `Variation ${i + 1} of ${n}: ${plan.n.toLocaleString()} strokes on the graphics card`
         : `Painting ${plan.n.toLocaleString()} strokes on the graphics card`);
       out = await live.paintFull(plan, q, {
-        snapshots: n > 1 ? 0 : 8, shouldStop: run.stopped,
-        onProgress: f => part(0.15 + 0.85 * f)
+        snapshots: 0, shouldStop: run.stopped,      /* the Timeline: one picture per take */
+        onProgress: f => part(0.30 + 0.70 * f)
       });
       if (!out || run.stopped()) return run.stop();
       if (!last) await run.take(out.canvas, 'brush');
@@ -848,6 +974,7 @@ async function gpuRun() {
     fd.append('canvas', out.canvas, 'canvas.png');
     fd.append('height', new Blob([out.height.buffer]), 'height.f16');
     out.shots.forEach((b, i) => fd.append('shots', b, `shot${i}.png`));
+    if (onGpu) fd.append('plan', new Blob([window.OilFX.encodePlan(plan)]), 'plan.osp');
     fd.append('seconds', String(out.seconds));
     fd.append('run', run.id);
     const r = await api('/api/gpu/result', { method: 'POST', body: fd, signal: run.signal });
@@ -923,6 +1050,15 @@ async function cpuRun() {
 
 /* Stop: a GPU Run ends at once; a CPU Run is told to stop (the server lets
    it go if it does not stop within a moment) */
+/* the Stop beside the progress bar does the same, and is on/off with it */
+(() => {
+  const top = $('#btn-stop'), bar = $('#bar-stop');
+  if (!bar) return;
+  bar.onclick = () => { if (!top.disabled) top.click(); };
+  const sync = () => { bar.disabled = top.disabled; };
+  new MutationObserver(sync).observe(top, { attributes: true, attributeFilter: ['disabled'] });
+  sync();
+})();
 $('#btn-stop').onclick = () => {
   state.gpuStop = true;
   if (state.abort) state.abort.abort();
@@ -1037,7 +1173,7 @@ $('#btn-snapshot').onclick = async () => {
   try {
     await api('/api/shot/snapshot', { method: 'POST' });
     shotIds = ''; const s = await api('/api/progress'); renderShots(s.shots, s.selected);
-    toast('Snapshot added', 'good');
+    toast('Pinned to the Timeline', 'good');
   } catch (err) { toast(err.message, 'bad'); }
 };
 
@@ -1053,14 +1189,60 @@ async function doUndo(kind) {
 $('#btn-undo').onclick = () => { doUndo('undo'); $('#btn-redo').disabled = false; };
 $('#btn-redo').onclick = () => doUndo('redo');
 window.addEventListener('keydown', e => {
-  if (e.target.matches('input,select,textarea')) return;
+  /* typing in a box keeps its own keys; a slider or tick box does not */
+  if (e.target.matches('select,textarea,input:not([type=range]):not([type=checkbox]):not([type=color])')) return;
   if (e.code === 'Space') { e.preventDefault(); if (!state.space) { state.space = true; updatePanCursor(); } return; }
-  if (e.key.toLowerCase() === 'b' && !e.ctrlKey && !e.metaKey && mainShowsAfter()) { setPeek(true); return; }
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); $('#btn-undo').click(); }
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); $('#btn-redo').click(); }
-  if (e.key === 'h') setTool('pan');
-  if (e.key === 'z') setTool('zoom');
+  if (e.key.toLowerCase() === 'b' && !e.ctrlKey && !e.metaKey && state.painted) { setPeek(true); return; }
+  /* Undo: Ctrl+Z (Windows) / Cmd+Z (Mac). Redo: Ctrl+Y, Ctrl+Shift+Z / Cmd+Shift+Z.
+     On Before it undoes the guiding lines, on After the brush strokes */
+  const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
+  if (mod && !e.altKey && (k === 'z' || k === 'y')) {
+    e.preventDefault();
+    undoRedo(k === 'y' || e.shiftKey ? 'redo' : 'undo');
+    return;
+  }
+  /* view (like Photoshop): Ctrl/Cmd + 0 fit, + 1 = 100 %, + plus / minus zoom,
+     Ctrl+Alt+I / Cmd+Option+I Image Size. e.code: the key itself, so a Mac's
+     Option (which types other letters) and the number pad work too */
+  if (mod && e.altKey && e.code === 'KeyI') { e.preventDefault(); openImageSize(); return; }
+  if (mod && !e.altKey) {
+    const c = e.code;
+    if (c === 'Digit0' || c === 'Numpad0') { e.preventDefault(); fitZoom(); return; }
+    if (c === 'Digit1' || c === 'Numpad1') { e.preventDefault(); state.pan = [0, 0]; setZoom(1); return; }
+    if (c === 'Equal' || c === 'NumpadAdd' || e.key === '+' || e.key === '=') { e.preventDefault(); setZoom((state.zoom || 1) * 1.25); return; }
+    if (c === 'Minus' || c === 'NumpadSubtract' || e.key === '-') { e.preventDefault(); setZoom((state.zoom || 1) / 1.25); return; }
+  }
+  if (mod || e.altKey) return;                       /* H and Z alone pick tools */
+  if (k === 'h') setTool('pan');
+  if (k === 'z') setTool('zoom');
+  if (k === '[' || k === ']') nudgeSize(k === ']' ? 1 : -1);
 });
+function undoRedo(kind) {
+  if (state.tab === 'before') {                      /* guiding lines */
+    state.guidesRedo = state.guidesRedo || [];
+    const from = kind === 'undo' ? state.guides : state.guidesRedo;
+    const to = kind === 'undo' ? state.guidesRedo : state.guides;
+    if (!from.length) return;
+    to.push(from.pop()); drawOverlay(); settingsChanged('guides');
+    return;
+  }
+  const b = $(kind === 'undo' ? '#btn-undo' : '#btn-redo');
+  if (!b.disabled) b.click();
+}
+/* [ and ] : brush size down / up (like Photoshop) */
+function nudgeSize(dir) {
+  const spec = window.TOOLS[state.tool];
+  const p = spec && (spec.params || []).find(x => x[0] === 'size');
+  if (!p || state.tab !== 'after') return;
+  const o = state.toolOpts[state.tool] || (state.toolOpts[state.tool] = {});
+  const s = toolSize(), step = s < 20 ? 2 : s < 60 ? 5 : 10;
+  o.size = Math.max(p[1], Math.min(p[2], s + dir * step));
+  $$('#tool-options .topt[data-k="size"]').forEach(x => { x.value = o.size; });
+  clearTimeout(state.ringTimer); state.ringFlash = true; drawOverlay();
+  state.ringTimer = setTimeout(() => { state.ringFlash = false; drawOverlay(); }, 1200);
+}
+/* no browser menu on the picture (right-drag and Ctrl+click are ours) */
+$('#canvas-wrap').addEventListener('contextmenu', e => e.preventDefault());
 window.addEventListener('keyup', e => {
   if (e.code === 'Space') { state.space = false; updatePanCursor(); }
   if (e.key.toLowerCase() === 'b') setPeek(false);
@@ -1097,6 +1279,39 @@ function fileNameOf(res, fallback) {
   const m = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(cd);
   return m ? decodeURIComponent(m[1] || m[2]) : fallback;
 }
+/* Image Size: what the photo and the painting measure; save at another size */
+async function openImageSize() {
+  if (!state.open) { toast('Open an image first.'); return; }
+  const dlg = $('#size-dlg');
+  let s;
+  try { s = await api('/api/size'); } catch (err) { toast(err.message, 'bad'); return; }
+  const fmt = v => v ? `${v.w} × ${v.h} px` : '—';
+  $('#sz-photo').textContent = fmt(s.photo);
+  $('#sz-paint').textContent = s.painting ? fmt(s.painting) : 'not painted yet';
+  const P = s.painting;
+  $('#sz-edit').hidden = !P; $('#sz-none').hidden = !!P; $('#sz-save').hidden = !P;
+  if (P) {
+    $('#sz-w').value = P.w; $('#sz-h').value = P.h; $('#sz-pct').value = 100;
+    const lock = () => $('#sz-lock').checked;
+    $('#sz-w').oninput = () => { const w = +$('#sz-w').value; if (lock() && w) { $('#sz-h').value = Math.round(w * P.h / P.w); } $('#sz-pct').value = Math.round(100 * w / P.w); };
+    $('#sz-h').oninput = () => { const h = +$('#sz-h').value; if (lock() && h) { $('#sz-w').value = Math.round(h * P.w / P.h); } $('#sz-pct').value = Math.round(100 * +$('#sz-w').value / P.w); };
+    $('#sz-pct').oninput = () => { const k = +$('#sz-pct').value / 100; if (k) { $('#sz-w').value = Math.round(P.w * k); $('#sz-h').value = Math.round(P.h * k); } };
+    $('#sz-save').onclick = async () => {
+      const w = Math.round(+$('#sz-w').value), h = Math.round(+$('#sz-h').value);
+      if (!(w >= 16 && h >= 16 && w <= 12000 && h <= 12000)) { toast('Width and height: 16 to 12000 px.', 'bad'); return; }
+      dlg.close();
+      await flushSync();
+      try {
+        const f = $('#export-format').value;
+        const res = await fetch(`/api/export?format=${f}&w=${w}&h=${h}`, { cache: 'no-store' });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Saving failed');
+        await saveBlob(await res.blob(), fileNameOf(res, 'painting.' + f));
+      } catch (err) { toast(err.message, 'bad'); }
+    };
+  }
+  if (!dlg.open) dlg.showModal();
+}
+
 $('#btn-export').onclick = async () => {
   await flushSync();
   if (liveOn() && live.previewing)

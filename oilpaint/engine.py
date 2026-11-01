@@ -115,9 +115,9 @@ def structure_tensor(gray: np.ndarray) -> dict:
     gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=5)
 
     sigma = max(1.5, min(h, w) / 180.0 * 2.0)
-    j11 = cv2.GaussianBlur(gx * gx, (0, 0), sigma)
-    j22 = cv2.GaussianBlur(gy * gy, (0, 0), sigma)
-    j12 = cv2.GaussianBlur(gx * gy, (0, 0), sigma)
+    j11 = ab.gblur(gx * gx, sigma)
+    j22 = ab.gblur(gy * gy, sigma)
+    j12 = ab.gblur(gx * gy, sigma)
 
     # eigen decomposition of the 2x2 symmetric tensor
     tmp = np.sqrt(np.maximum((j11 - j22) ** 2 + 4.0 * j12 * j12, 0.0))
@@ -401,7 +401,7 @@ def paint(image_bgr: np.ndarray, p: dict, progress=None, snapshots: int = 8,
 
     from .params import SEED_KEYS
     style = p.get("paint_style")
-    if style in SEED_KEYS and int(p.get("samples", 8)) > 1 and snapshots > 0:
+    if style in SEED_KEYS and int(p.get("samples", 4)) > 1 and snapshots > 0:
         return _paint_variations(image_bgr, p, progress, on_snapshot, should_stop)
     if style in ("Canvas Oil", "Halftone", "Painted Photo", "Impression", "Oil Smear", "Oil Paint FX", "Sketch Paint",
                  "Rough Brush", "Watercolor", "Silk Oil"):
@@ -410,112 +410,58 @@ def paint(image_bgr: np.ndarray, p: dict, progress=None, snapshots: int = 8,
     t_start = time.time()
     src = image_bgr.astype(np.float32)
     h, w = src.shape[:2]
-    rng = np.random.default_rng(int(p["random_seed"]))
     raster_rng = np.random.default_rng(int(p["random_seed"]) + 7919)
 
     def report(frac, label):
         if progress:
             progress(max(0.0, min(1.0, frac)), label)
 
-    # --- 0-2. analysis: Abstract distortion, simplification, directions ----
+    # --- plan every stroke: brushplan, the same steps the GPU runs ----------
+    from . import brushplan as BP
     report(0.04, "Analysing the photograph")
-    an = pl.analyse(image_bgr, p, cache, token)
-    lay = pl.layout(p, h, w)
-    radii = lay["radii"]
-    correct = pl.correction_active(p)
+    work = ab.distort(src, p) if pl.distortion_key(p) is not None else src
+    bcache = cache.bp if isinstance(cache, pl.AnalysisCache) and cache.bp is not None else None
+    plan = BP.plan_bgr(work, p, side=BP.RUN_SIDE, cache=bcache, token=token,
+                       report=lambda f, s: report(0.04 + 0.14 * f, s))
+    if should_stop and should_stop():
+        raise PaintStopped()
 
-    def target(img):
-        # Abstract Art > Correction is applied to the paint, so the painter
-        # compares the canvas with the corrected reference
-        return ab.correct(img, p) if correct else img
-
-    # --- 4. canvas ---------------------------------------------------------
-    report(0.16, "Preparing the canvas")
-    ground = pl.make_ground(target(an["ref"]), p, lay)
-    canvas = ground.copy()
+    # --- paint them ----------------------------------------------------------
+    canvas = plan.ground.astype(np.float32).copy()
+    if pl.correction_active(p):
+        canvas = ab.correct(canvas, p)
     height = np.zeros((h, w), np.float32)
     coverage = np.zeros((h, w), np.float32)
     brush = Brush(canvas, height, coverage)
-
-    # progress is measured in grid cells examined, layer by layer, the same
-    # yardstick as before - it does not depend on how many strokes pass
-    cells = []
-    for li, r in enumerate(radii):
-        step = max(2.0, r * (1.05 if li == 0 else 0.85))
-        cells.append(int(math.ceil(h / step) * math.ceil(w / step)))
-    planned = max(1, sum(cells))
-
+    st, pts, offs = plan.strokes, plan.pts, plan.offs
+    n = plan.count
+    sty = pl.stroke_style(st, p, (w, h)) if n else None
     shots = []
     milestones = [(i + 1) / (snapshots + 1) for i in range(snapshots)]
     state = {"done": 0, "stopped": False}
-    parts = []
+    names = {pl.KIND_LAYER: "Painting the layers", pl.KIND_LAST: "Painting the details",
+             pl.KIND_FILL: "Filling empty spaces", pl.KIND_EDGE: "Edge strokes"}
+    for i in range(n):
+        if (i & 255) == 0:
+            if should_stop and should_stop():
+                state["stopped"] = True
+                break
+            report(0.18 + 0.72 * i / n, names.get(int(st[i, pl.C_KIND]), "Painting"))
+        while milestones and i / n >= milestones[0]:
+            milestones.pop(0)
+            shots.append(_present(canvas, height, p, src, quick=True))
+            if on_snapshot:
+                on_snapshot(len(shots) - 1, shots[-1])
+        ok = brush.stroke(pts[offs[i]:offs[i + 1]], sty["colour"][i], float(st[i, pl.C_T]),
+                          float(sty["hair"][i]), int(sty["nb"][i]),
+                          softness=float(sty["soft"][i]), opacity=float(sty["opacity"][i]),
+                          height_amt=float(sty["height"][i]),
+                          shade_var=float(sty["shade_var"][i]), rng=raster_rng,
+                          flat=bool(sty["flat"][i]))
+        if ok:
+            state["done"] += 1
 
-    def lay_down(part, frac0, frac1, label):
-        """Paint the planned strokes of one part, with progress and shots."""
-        st = part["strokes"]
-        n = len(st)
-        if not n:
-            return
-        sty = pl.stroke_style(st, p, (w, h))
-        pts, offs = part["pts"], part["offs"]
-        for i in range(n):
-            if (i & 255) == 0:
-                if should_stop and should_stop():
-                    state["stopped"] = True
-                    return
-                frac = frac0 + (frac1 - frac0) * (i / n)
-                report(0.18 + 0.66 * frac, label)
-            while milestones and frac0 + (frac1 - frac0) * (i / n) >= milestones[0]:
-                milestones.pop(0)
-                shots.append(_present(canvas, height, p, src, quick=True))
-                if on_snapshot:
-                    on_snapshot(len(shots) - 1, shots[-1])
-            ok = brush.stroke(pts[offs[i]:offs[i + 1]], sty["colour"][i], float(st[i, pl.C_T]),
-                              float(sty["hair"][i]), int(sty["nb"][i]),
-                              softness=float(sty["soft"][i]), opacity=float(sty["opacity"][i]),
-                              height_amt=float(sty["height"][i]),
-                              shade_var=float(sty["shade_var"][i]), rng=raster_rng,
-                              flat=bool(sty["flat"][i]))
-            if ok:
-                state["done"] += 1
-
-    # --- 5. coarse-to-fine painting layers ---------------------------------
-    seen = 0
-    for li in range(len(radii)):
-        if state["stopped"]:
-            break
-        score = None
-        if li > 0:
-            # where the canvas still differs from what we are aiming at,
-            # weighted towards the contours: a painter's finishing strokes go
-            # where the drawing is - eyes, edges, accents
-            ref_l = target(pl.layer_refs(an, lay, li)[0])
-            err = np.linalg.norm(canvas - ref_l, axis=2)
-            score = err * (0.40 + 1.80 * an["grad"])
-        report(0.18 + 0.66 * seen / planned, f"Planning layer {li + 1}/{len(radii)}")
-        part = pl.plan_layer(an, lay, li, score, rng, p)
-        part.pop("ref_l", None)
-        part.pop("cells", None)
-        parts.append(part)
-        lay_down(part, seen / planned, (seen + cells[li]) / planned,
-                 f"Painting layer {li + 1}/{len(radii)}")
-        seen += cells[li]
-
-    # --- 6. filling: complete the painting in the empty spaces -------------
-    if not state["stopped"]:
-        report(0.86, "Filling empty spaces")
-        part = pl.plan_fill(an, lay, coverage, rng)
-        parts.append(part)
-        lay_down(part, 1.0, 1.0, "Filling empty spaces")
-
-    report(0.90, "Drying the paint")
-
-    # --- 7. edge strokes ---------------------------------------------------
-    if not state["stopped"]:
-        part = pl.plan_edges(an, p)
-        parts.append(part)
-        lay_down(part, 1.0, 1.0, "Edge strokes")
-
+    report(0.92, "Drying the paint")
     while milestones and not state["stopped"]:
         milestones.pop(0)
         shots.append(_present(canvas, height, p, src, quick=True))
@@ -526,12 +472,6 @@ def paint(image_bgr: np.ndarray, p: dict, progress=None, snapshots: int = 8,
     shots.append(result)
     if on_snapshot:
         on_snapshot(len(shots) - 1, result)
-
-    allp = pl.concat(parts)
-    plan = pl.Plan(size=(w, h), strokes=allp["strokes"], pts=allp["pts"], offs=allp["offs"],
-                   ground=pl.make_ground(an["ref"], p, lay),
-                   meta={"base_t": lay["base_t"],
-                         "edge_base": pl.edge_base_thickness(p, h, w)})
 
     report(1.0, "Done")
     meta = {
@@ -768,7 +708,7 @@ def _paint_variations(image_bgr, p, progress, on_snapshot, should_stop):
     t_start = time.time()
     style = p.get("paint_style")
     key = SEED_KEYS[style]
-    n = int(np.clip(int(p.get("samples", 8)), 1, 16))
+    n = int(np.clip(int(p.get("samples", 4)), 1, 16))
     base = int(p.get(key, 1))
     if style == "Brush Strokes" and n > 1:
         out = _paint_variations_proc(image_bgr, p, progress, on_snapshot, should_stop, key, n, base)
