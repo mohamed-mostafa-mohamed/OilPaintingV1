@@ -1,15 +1,15 @@
 # Builds OilStudio for Macs with Apple Silicon (M1 / M2 / M3 / M4) on
-# GitHub's own Apple Silicon Mac, as an easy-to-install .dmg:
-#   open the .dmg -> double-click "Install OilStudio" -> done.
+# GitHub's own Apple Silicon Mac, as a .zip:
+#   unzip -> drag OilStudio into Applications -> open it.
 #
 # How to use:
 #   1. Push this file to GitHub (folder .github/workflows/), with
 #      build/mac/ (installer + entitlements) and build/CLIENT-README.txt.
 #   2. GitHub > your repo > "Actions" tab > "Build Mac (Apple Silicon)"
 #      > "Run workflow" > choose > "Run workflow".
-#   3. Get the .dmg:
+#   3. Get the .zip:
 #        - "Publish as a GitHub Release" ticked: repo page > Releases >
-#          the version > OilStudio-mac-apple-silicon.dmg (a plain link to
+#          the version > OilStudio-mac-apple-silicon.zip (a plain link to
 #          send to clients)
 #        - otherwise: the finished run > Artifacts (needs a GitHub login)
 #
@@ -23,7 +23,7 @@
 #   APPLE_TEAM_ID           your 10-character Team ID
 #   APPLE_APP_PASSWORD      an app-specific password (appleid.apple.com)
 # Without them the app is signed "ad hoc" (free): the client approves the
-# installer once ("Open Anyway"), see build/CLIENT-README.txt.
+# app once ("Open Anyway"), see build/CLIENT-README.txt.
 name: Build Mac (Apple Silicon)
 
 on:
@@ -53,7 +53,7 @@ jobs:
     timeout-minutes: 90
     env:
       APP_NAME: OilStudio
-      DMG_NAME: OilStudio-mac-apple-silicon
+      ZIP_NAME: OilStudio-mac-apple-silicon
       DIST: ${{ inputs.edition == 'plain' && 'dist' || 'dist-protected' }}
       HAS_CERT: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.APPLE_ID != '' }}
     steps:
@@ -83,7 +83,6 @@ jobs:
           if [ "${{ inputs.edition }}" = "protected" ]; then
             pip install cython setuptools rjsmin rcssmin
           fi
-          brew install create-dmg || true
 
       # ---- build the app -------------------------------------------------
       - name: Protect the code
@@ -170,60 +169,32 @@ jobs:
           if [ $ok = 1 ]; then echo "The app started ($(wc -c < page.html) bytes page)."
           else echo "::error::The app did not start. Its output:"; cat app.log; exit 1; fi
 
-      # ---- the .dmg: app, Applications shortcut, one-click installer, READ ME
-      - name: Stage the .dmg contents
+      # ---- the .zip: OilStudio.app, READ ME, and an optional one-click installer
+      - name: Make the .zip
         run: |
-          STAGE="$DIST/dmg"; OUT="$DIST/out"
-          rm -rf "$STAGE" "$OUT"; mkdir -p "$STAGE" "$OUT"
-          ditto "$DIST/$APP_NAME.app" "$STAGE/$APP_NAME.app"
-          cp "build/mac/Install OilStudio.command" "$STAGE/Install OilStudio.command"
-          chmod +x "$STAGE/Install OilStudio.command"
-          cp build/CLIENT-README.txt "$STAGE/READ ME.txt"
-          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
-          echo "DMG=$OUT/$DMG_NAME.dmg" >> "$GITHUB_ENV"
+          PACK="$DIST/pack/OilStudio"; OUT="$DIST/out"
+          rm -rf "$DIST/pack" "$OUT"; mkdir -p "$PACK" "$OUT"
+          ditto "$DIST/$APP_NAME.app" "$PACK/$APP_NAME.app"
+          cp build/CLIENT-README.txt "$PACK/READ ME.txt"
+          cp "build/mac/Install OilStudio.command" "$PACK/Install OilStudio.command"
+          chmod +x "$PACK/Install OilStudio.command"
+          ZIP="$OUT/$ZIP_NAME.zip"
+          # ditto keeps the app's links, permissions and signature (plain zip breaks them)
+          ditto -c -k --sequesterRsrc --keepParent "$PACK" "$ZIP"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          ls -lh "$OUT"
 
-      # a tidy window: the app, the Applications shortcut, the installer
-      - name: Make the .dmg (laid out)
-        timeout-minutes: 8
-        continue-on-error: true
+      - name: Check the .zip unpacks to a working app
         run: |
-          ICON=""; [ -f build/icon.icns ] && ICON="--volicon build/icon.icns"
-          create-dmg --volname "$APP_NAME" $ICON \
-            --window-size 640 420 --icon-size 100 --text-size 13 \
-            --icon "$APP_NAME.app" 170 150 --app-drop-link 470 150 \
-            --icon "Install OilStudio.command" 170 300 --icon "READ ME.txt" 470 300 \
-            --hide-extension "Install OilStudio.command" --no-internet-enable \
-            "$DMG" "$STAGE"
-
-      - name: Make the .dmg (plain, if the laid-out one failed)
-        run: |
-          if [ -f "$DMG" ] && hdiutil imageinfo "$DMG" >/dev/null 2>&1; then echo "Laid-out .dmg is fine"; exit 0; fi
-          rm -f "$DMG"; ln -sf /Applications "$STAGE/Applications"
-          hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
-          ls -lh "$DMG"
-
-      - name: Sign and notarize the .dmg
-        if: env.HAS_CERT == 'true'
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APP_PW: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: |
-          codesign --force --timestamp --sign "$IDENT" "$DMG"
-          xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$APP_PW" --wait
-          xcrun stapler staple "$DMG"
-
-      - name: Check the .dmg opens
-        run: |
-          MNT=$(mktemp -d)
-          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT" >/dev/null
-          ls -la "$MNT"
-          test -d "$MNT/$APP_NAME.app" && test -x "$MNT/Install OilStudio.command"
-          hdiutil detach "$MNT" >/dev/null
+          T=$(mktemp -d)
+          ditto -x -k "$ZIP" "$T"
+          ls -la "$T/OilStudio"
+          codesign --verify --deep --strict "$T/OilStudio/$APP_NAME.app"
+          test -x "$T/OilStudio/$APP_NAME.app/Contents/MacOS/$APP_NAME"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.DMG_NAME }}-${{ inputs.edition }}
+          name: ${{ env.ZIP_NAME }}-${{ inputs.edition }}
           path: ${{ env.DIST }}/out/
           retention-days: 30
 
@@ -234,13 +205,13 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           NOTES="OilStudio for Mac with Apple Silicon (M1-M4).
-          Install: open the .dmg, double-click \"Install OilStudio\". See READ ME inside."
+          Install: unzip, drag OilStudio into Applications, open it. See READ ME inside."
           if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" "$DMG" --clobber
+            gh release upload "$VERSION" "$ZIP" --clobber
           else
-            gh release create "$VERSION" "$DMG" --title "OilStudio $VERSION" --notes "$NOTES"
+            gh release create "$VERSION" "$ZIP" --title "OilStudio $VERSION" --notes "$NOTES"
           fi
-          echo "Download link: https://github.com/${{ github.repository }}/releases/download/$VERSION/$DMG_NAME.dmg"
+          echo "Download link: https://github.com/${{ github.repository }}/releases/download/$VERSION/$ZIP_NAME.zip"
 
       - name: Show the app's log if something failed
         if: failure()
