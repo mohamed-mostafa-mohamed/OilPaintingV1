@@ -1,0 +1,247 @@
+# Builds OilStudio for Macs with Apple Silicon (M1 / M2 / M3 / M4) on
+# GitHub's own Apple Silicon Mac, as an easy-to-install .dmg:
+#   open the .dmg -> double-click "Install OilStudio" -> done.
+#
+# How to use:
+#   1. Push this file to GitHub (folder .github/workflows/), with
+#      build/mac/ (installer + entitlements) and build/CLIENT-README.txt.
+#   2. GitHub > your repo > "Actions" tab > "Build Mac (Apple Silicon)"
+#      > "Run workflow" > choose > "Run workflow".
+#   3. Get the .dmg:
+#        - "Publish as a GitHub Release" ticked: repo page > Releases >
+#          the version > OilStudio-mac-apple-silicon.dmg (a plain link to
+#          send to clients)
+#        - otherwise: the finished run > Artifacts (needs a GitHub login)
+#
+# No warnings at all for clients (optional): with an Apple Developer
+# account (99 USD a year) add these repository secrets (Settings >
+# Secrets and variables > Actions) and the app is signed and notarized:
+#   MACOS_CERT_P12_BASE64   your "Developer ID Application" certificate
+#                           (.p12) as base64:  base64 -i cert.p12 | pbcopy
+#   MACOS_CERT_PASSWORD     the .p12's password
+#   APPLE_ID                your Apple ID e-mail
+#   APPLE_TEAM_ID           your 10-character Team ID
+#   APPLE_APP_PASSWORD      an app-specific password (appleid.apple.com)
+# Without them the app is signed "ad hoc" (free): the client approves the
+# installer once ("Open Anyway"), see build/CLIENT-README.txt.
+name: Build Mac (Apple Silicon)
+
+on:
+  workflow_dispatch:
+    inputs:
+      edition:
+        description: "Which app to build"
+        type: choice
+        options: [protected, plain]
+        default: protected
+      release:
+        description: "Publish as a GitHub Release (a download link for clients)"
+        type: boolean
+        default: true
+      version:
+        description: "Version for the Release, e.g. v1.4"
+        type: string
+        default: v1.0
+
+permissions:
+  contents: write            # to publish the Release
+
+jobs:
+  mac-arm64:
+    name: Mac Apple Silicon (${{ inputs.edition }})
+    runs-on: macos-15        # GitHub's Apple Silicon (arm64) Mac
+    timeout-minutes: 90
+    env:
+      APP_NAME: OilStudio
+      DMG_NAME: OilStudio-mac-apple-silicon
+      DIST: ${{ inputs.edition == 'plain' && 'dist' || 'dist-protected' }}
+      HAS_CERT: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.APPLE_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check this is an Apple Silicon Mac
+        run: |
+          echo "Machine: $(uname -m), macOS $(sw_vers -productVersion)"
+          test "$(uname -m)" = "arm64" || { echo "::error::Not an Apple Silicon runner"; exit 1; }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: arm64
+          cache: pip
+
+      # Node.js lets protect.py scramble the JavaScript names (terser)
+      - uses: actions/setup-node@v4
+        if: inputs.edition == 'protected'
+        with:
+          node-version: "20"
+
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          if [ "${{ inputs.edition }}" = "protected" ]; then
+            pip install cython setuptools rjsmin rcssmin
+          fi
+          brew install create-dmg || true
+
+      # ---- build the app -------------------------------------------------
+      - name: Protect the code
+        if: inputs.edition == 'protected'
+        run: python build/protect.py --out .release
+
+      - name: Build OilStudio.app (protected)
+        if: inputs.edition == 'protected'
+        working-directory: .release
+        run: pyinstaller --noconfirm --clean --workpath ../.pyi-work-protected --distpath ../dist-protected OilStudio-protected.spec
+
+      - name: Build OilStudio.app (plain)
+        if: inputs.edition == 'plain'
+        run: pyinstaller --noconfirm --clean --workpath .pyi-work --distpath dist OilStudio.spec
+
+      - name: Check the app is Apple Silicon (arm64)
+        run: |
+          APP="$DIST/$APP_NAME.app"
+          test -d "$APP" || { echo "::error::$APP was not made"; exit 1; }
+          lipo -archs "$APP/Contents/MacOS/$APP_NAME" | grep -q arm64 || { echo "::error::Not built for arm64"; exit 1; }
+          bad=0
+          while IFS= read -r -d '' f; do
+            if file "$f" | grep -q "Mach-O" && ! lipo -archs "$f" 2>/dev/null | grep -q arm64; then
+              echo "::warning::not arm64: ${f#$APP/}"; bad=1
+            fi
+          done < <(find "$APP" -type f \( -name "*.so" -o -name "*.dylib" \) -print0)
+          if [ $bad = 0 ]; then echo "All libraries are arm64."; fi
+          du -sh "$APP"
+
+      # ---- sign ------------------------------------------------------------
+      - name: Sign (ad hoc - no Apple account)
+        if: env.HAS_CERT != 'true'
+        run: |
+          codesign --force --deep --sign - "$DIST/$APP_NAME.app"
+          codesign --verify --deep --strict "$DIST/$APP_NAME.app"
+
+      - name: Sign with Developer ID and notarize the app
+        if: env.HAS_CERT == 'true'
+        env:
+          CERT_B64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_PW: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          APP="$DIST/$APP_NAME.app"
+          KC=build.keychain; KCPW=$(uuidgen)
+          security create-keychain -p "$KCPW" $KC
+          security set-keychain-settings -lut 21600 $KC
+          security unlock-keychain -p "$KCPW" $KC
+          security list-keychains -d user -s $KC $(security list-keychains -d user | tr -d '"')
+          echo "$CERT_B64" | base64 --decode > cert.p12
+          security import cert.p12 -k $KC -P "$CERT_PW" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" $KC >/dev/null
+          rm cert.p12
+          IDENT=$(security find-identity -v -p codesigning $KC | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)"/\1/')
+          test -n "$IDENT" || { echo "::error::No 'Developer ID Application' certificate in MACOS_CERT_P12_BASE64"; exit 1; }
+          echo "Signing as: $IDENT"
+          SIGN="codesign --force --timestamp --options runtime --entitlements build/mac/entitlements.plist --sign"
+          # inside out: every library and program first, then the app
+          find "$APP/Contents" -type f | while read -r f; do
+            if file "$f" | grep -q "Mach-O"; then $SIGN "$IDENT" "$f"; fi
+          done
+          $SIGN "$IDENT" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" app.zip
+          xcrun notarytool submit app.zip --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$APP_PW" --wait
+          xcrun stapler staple "$APP"
+          rm app.zip
+          echo "IDENT=$IDENT" >> "$GITHUB_ENV"
+
+      # ---- test ------------------------------------------------------------
+      - name: Test - start the app and load its page
+        run: |
+          PORT=8765 "$DIST/$APP_NAME.app/Contents/MacOS/$APP_NAME" > app.log 2>&1 &
+          PID=$!
+          ok=0
+          for i in $(seq 1 300); do
+            if curl -fs "http://127.0.0.1:8765/" -o page.html; then ok=1; break; fi
+            if ! kill -0 $PID 2>/dev/null; then break; fi
+            sleep 0.3
+          done
+          kill $PID 2>/dev/null || true
+          if [ $ok = 1 ]; then echo "The app started ($(wc -c < page.html) bytes page)."
+          else echo "::error::The app did not start. Its output:"; cat app.log; exit 1; fi
+
+      # ---- the .dmg: app, Applications shortcut, one-click installer, READ ME
+      - name: Stage the .dmg contents
+        run: |
+          STAGE="$DIST/dmg"; OUT="$DIST/out"
+          rm -rf "$STAGE" "$OUT"; mkdir -p "$STAGE" "$OUT"
+          ditto "$DIST/$APP_NAME.app" "$STAGE/$APP_NAME.app"
+          cp "build/mac/Install OilStudio.command" "$STAGE/Install OilStudio.command"
+          chmod +x "$STAGE/Install OilStudio.command"
+          cp build/CLIENT-README.txt "$STAGE/READ ME.txt"
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+          echo "DMG=$OUT/$DMG_NAME.dmg" >> "$GITHUB_ENV"
+
+      # a tidy window: the app, the Applications shortcut, the installer
+      - name: Make the .dmg (laid out)
+        timeout-minutes: 8
+        continue-on-error: true
+        run: |
+          ICON=""; [ -f build/icon.icns ] && ICON="--volicon build/icon.icns"
+          create-dmg --volname "$APP_NAME" $ICON \
+            --window-size 640 420 --icon-size 100 --text-size 13 \
+            --icon "$APP_NAME.app" 170 150 --app-drop-link 470 150 \
+            --icon "Install OilStudio.command" 170 300 --icon "READ ME.txt" 470 300 \
+            --hide-extension "Install OilStudio.command" --no-internet-enable \
+            "$DMG" "$STAGE"
+
+      - name: Make the .dmg (plain, if the laid-out one failed)
+        run: |
+          if [ -f "$DMG" ] && hdiutil imageinfo "$DMG" >/dev/null 2>&1; then echo "Laid-out .dmg is fine"; exit 0; fi
+          rm -f "$DMG"; ln -sf /Applications "$STAGE/Applications"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+          ls -lh "$DMG"
+
+      - name: Sign and notarize the .dmg
+        if: env.HAS_CERT == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_PW: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          codesign --force --timestamp --sign "$IDENT" "$DMG"
+          xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$APP_PW" --wait
+          xcrun stapler staple "$DMG"
+
+      - name: Check the .dmg opens
+        run: |
+          MNT=$(mktemp -d)
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT" >/dev/null
+          ls -la "$MNT"
+          test -d "$MNT/$APP_NAME.app" && test -x "$MNT/Install OilStudio.command"
+          hdiutil detach "$MNT" >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DMG_NAME }}-${{ inputs.edition }}
+          path: ${{ env.DIST }}/out/
+          retention-days: 30
+
+      - name: Publish as a GitHub Release
+        if: inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          NOTES="OilStudio for Mac with Apple Silicon (M1-M4).
+          Install: open the .dmg, double-click \"Install OilStudio\". See READ ME inside."
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "$DMG" --clobber
+          else
+            gh release create "$VERSION" "$DMG" --title "OilStudio $VERSION" --notes "$NOTES"
+          fi
+          echo "Download link: https://github.com/${{ github.repository }}/releases/download/$VERSION/$DMG_NAME.dmg"
+
+      - name: Show the app's log if something failed
+        if: failure()
+        run: cat app.log 2>/dev/null || true
